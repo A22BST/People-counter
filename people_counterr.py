@@ -1,11 +1,12 @@
 """
-People Counter: Full Detection Pipeline
+People Counter: Full Detection Pipeline (v2.0 - Sensor Fusion v2)
 
 Integrates:
 - YOLOv8 for person detection
 - ByteTrack for multi-object tracking
 - DirectionDetector for entry/exit classification
 - Standby Slot Method for unique visitor counting
+- Sensor Fusion v2 with ToF dual-zone direction detection
 - Live diagnostics and analysis
 
 Supports:
@@ -13,8 +14,17 @@ Supports:
 - USB/built-in camera
 - Video file input (for testing)
 
+Changes from v1.1:
+- sensor_fusion_v2 replaces sensor_fusion (ToF-focused, no radar)
+- FusionConfig object replaces positional args
+- New strategies: confirmation, dual_zone, hybrid (replaces tiebreaker, crossing)
+- Simplified CameraEvent (trigger field instead of area_trend/y_trend)
+- create_camera_event() replaces create_camera_event_from_detector_event()
+- ToF-only event detection (camera missed, ToF caught)
+- FusedDecision now has track_id and tof_confidence
+
 Author: Ahmad's Mosque Attendance System
-Version: 1.1.0
+Version: 2.0.0
 """
 
 # ============================================================================
@@ -36,7 +46,7 @@ SPAWN_NEAR_THRESHOLD = 0.57      # Where exits appear (bottom of frame, 0-1)
 AREA_SHRINK_FOR_DEPART = 0.372    # Area ratio for "departing" (<1 = shrinking)
 MIN_TRACK_DURATION_MS = 10     # Minimum track lifetime to count (milliseconds)
 
-# ===== NEW: Threshold crossing settings =====
+# ===== Threshold crossing settings =====
 COUNT_ON_CROSSING = True         # True = count when crossing threshold (recommended)
                                  # False = count when track terminates (legacy)
 CROSSING_HYSTERESIS = 0.03       # Buffer zone to prevent double-counting (3% of frame)
@@ -65,13 +75,14 @@ from pathlib import Path
 
 from direction_detector import DirectionDetector, DirectionDetectorConfig, CrossingConfidence
 
-# Try to import sensor fusion (optional - for ESP32 radar/ToF integration)
+# Try to import sensor fusion v2 (optional - for ESP32 ToF integration)
 try:
-    from sensor_fusion import (
+    from sensor_fusion_v2 import (
         SensorFusionEngine,
+        FusionConfig,
         CameraEvent,
-        create_camera_event_from_detector_event,
-        get_track_history_for_event
+        FusedDecision,
+        create_camera_event,
     )
     HAS_FUSION = True
 except ImportError:
@@ -99,342 +110,188 @@ class TrackAnalyzer:
     """
     
     def __init__(self):
-        self.track_histories: Dict[int, List[dict]] = defaultdict(list)
-        self.completed_tracks: List[dict] = []
-        self.start_time: float = time.time()
-        self.frame_count: int = 0
-        self.detection_counts: List[int] = []  # Detections per frame
-        
-    def record_frame(self, detections: List[Tuple[int, Tuple[float, float, float, float]]], 
-                     frame_num: int, frame_height: int):
-        """Record detections for analysis"""
-        self.frame_count = frame_num
+        self.tracks = {}  # track_id -> track data
+        self.completed_tracks = []
+        self.frame_count = 0
+        self.detection_counts = []
+        self.start_time = time.time()
+    
+    def record_frame(self, detections, frame_number, frame_height):
+        """Record detections for this frame"""
+        self.frame_count = frame_number
         self.detection_counts.append(len(detections))
         
-        for track_id, (x1, y1, x2, y2) in detections:
+        for track_id, bbox in detections:
+            x1, y1, x2, y2 = bbox
+            center_y = (y1 + y2) / 2.0 / frame_height
             area = (x2 - x1) * (y2 - y1)
-            centroid_y = (y1 + y2) / 2
-            y_normalized = centroid_y / frame_height
             
-            self.track_histories[track_id].append({
-                'frame': frame_num,
-                'area': area,
-                'y_normalized': y_normalized,
-                'bbox': (x1, y1, x2, y2),
-                'timestamp': time.time()
-            })
-    
-    def finalize_track(self, track_id: int, direction: Optional[str], 
-                       confidence: Optional[str], event_data: Optional[dict] = None):
-        """Mark track as complete with final classification"""
-        if track_id in self.track_histories:
-            history = self.track_histories[track_id]
-            if len(history) > 0:
-                track_data = {
+            if track_id not in self.tracks:
+                self.tracks[track_id] = {
                     'track_id': track_id,
-                    'direction': direction,
-                    'confidence': confidence,
-                    'duration_frames': len(history),
-                    'duration_seconds': history[-1]['timestamp'] - history[0]['timestamp'],
-                    'spawn_y': history[0]['y_normalized'],
-                    'termination_y': history[-1]['y_normalized'],
-                    'spawn_area': history[0]['area'],
-                    'termination_area': history[-1]['area'],
-                    'area_ratio': history[-1]['area'] / history[0]['area'] if history[0]['area'] > 0 else 1.0,
-                    'y_travel': abs(history[-1]['y_normalized'] - history[0]['y_normalized']),
+                    'spawn_y': center_y,
+                    'spawn_area': area,
+                    'spawn_frame': frame_number,
+                    'y_history': [],
+                    'area_history': [],
+                    'frame_count': 0
                 }
-                if event_data:
-                    track_data.update(event_data)
-                self.completed_tracks.append(track_data)
-            # Clean up history to save memory
-            del self.track_histories[track_id]
+            
+            t = self.tracks[track_id]
+            t['y_history'].append(center_y)
+            t['area_history'].append(area)
+            t['frame_count'] += 1
+            t['last_y'] = center_y
+            t['last_area'] = area
+            t['last_frame'] = frame_number
     
-    def _analyze_pattern(self, tracks: List[dict], label: str) -> dict:
-        """Analyze patterns in a set of tracks"""
-        if not tracks:
-            return {'count': 0}
-        
-        spawn_ys = [t['spawn_y'] for t in tracks]
-        term_ys = [t['termination_y'] for t in tracks]
-        area_ratios = [t['area_ratio'] for t in tracks]
-        durations = [t['duration_frames'] for t in tracks]
-        y_travels = [t['y_travel'] for t in tracks]
-        
-        return {
-            'count': len(tracks),
-            'spawn_y': {
-                'mean': float(np.mean(spawn_ys)),
-                'std': float(np.std(spawn_ys)),
-                'min': float(np.min(spawn_ys)),
-                'max': float(np.max(spawn_ys))
-            },
-            'termination_y': {
-                'mean': float(np.mean(term_ys)),
-                'std': float(np.std(term_ys)),
-                'min': float(np.min(term_ys)),
-                'max': float(np.max(term_ys))
-            },
-            'area_ratio': {
-                'mean': float(np.mean(area_ratios)),
-                'std': float(np.std(area_ratios)),
-                'min': float(np.min(area_ratios)),
-                'max': float(np.max(area_ratios))
-            },
-            'duration_frames': {
-                'mean': float(np.mean(durations)),
-                'std': float(np.std(durations)),
-                'min': int(np.min(durations)),
-                'max': int(np.max(durations))
-            },
-            'y_travel': {
-                'mean': float(np.mean(y_travels)),
-                'std': float(np.std(y_travels)),
-                'min': float(np.min(y_travels)),
-                'max': float(np.max(y_travels))
-            }
-        }
-    
-    def _calculate_recommended_thresholds(self) -> dict:
-        """Calculate recommended threshold values based on observed patterns"""
-        entries = [t for t in self.completed_tracks if t['direction'] == 'IN']
-        exits = [t for t in self.completed_tracks if t['direction'] == 'OUT']
-        
-        recommendations = {}
-        
-        if entries:
-            entry_term_ys = [t['termination_y'] for t in entries]
-            recommendations['near_edge_threshold'] = float(np.percentile(entry_term_ys, 25))
-            
-            entry_spawn_ys = [t['spawn_y'] for t in entries]
-            recommendations['spawn_far_threshold'] = float(np.percentile(entry_spawn_ys, 75))
-            
-            entry_ratios = [t['area_ratio'] for t in entries]
-            recommendations['area_growth_for_approach'] = float(np.percentile(entry_ratios, 25))
-        
-        if exits:
-            exit_spawn_ys = [t['spawn_y'] for t in exits]
-            recommendations['spawn_near_threshold'] = float(np.percentile(exit_spawn_ys, 25))
-            
-            exit_ratios = [t['area_ratio'] for t in exits]
-            recommendations['area_shrink_for_depart'] = float(np.percentile(exit_ratios, 75))
-        
-        valid_tracks = [t for t in self.completed_tracks if t['direction']]
-        if valid_tracks:
-            durations = [t['duration_frames'] for t in valid_tracks]
-            recommendations['min_track_duration_frames'] = int(np.percentile(durations, 10))
-        
-        return recommendations
+    def finalize_track(self, track_id, direction=None, confidence=None, event=None):
+        """Mark a track as completed"""
+        if track_id in self.tracks:
+            t = self.tracks[track_id]
+            t['direction'] = direction
+            t['confidence'] = confidence
+            if event:
+                t['trigger'] = event.get('trigger', 'unknown')
+                t['duration_ms'] = event.get('duration_ms', 0)
+            self.completed_tracks.append(t)
     
     def generate_report(self) -> dict:
-        """Generate comprehensive diagnostic report"""
-        runtime = time.time() - self.start_time
+        """Generate diagnostic report"""
+        elapsed = time.time() - self.start_time
         
-        # Finalize any remaining active tracks as abandoned
-        for track_id in list(self.track_histories.keys()):
-            self.finalize_track(track_id, None, None)
-        
-        if not self.completed_tracks:
-            return {
-                'error': 'No tracks recorded',
-                'runtime_seconds': runtime,
-                'total_frames': self.frame_count
-            }
-        
-        # Separate by direction
-        entries = [t for t in self.completed_tracks if t['direction'] == 'IN']
-        exits = [t for t in self.completed_tracks if t['direction'] == 'OUT']
-        abandoned = [t for t in self.completed_tracks if t['direction'] is None]
-        
-        # Confidence breakdown
-        high_conf = [t for t in self.completed_tracks if t.get('confidence') == 'HIGH']
-        med_conf = [t for t in self.completed_tracks if t.get('confidence') == 'MEDIUM']
-        low_conf = [t for t in self.completed_tracks if t.get('confidence') == 'LOW']
-        
-        # Calculate FPS
-        avg_fps = self.frame_count / runtime if runtime > 0 else 0
-        
-        # Detection statistics
-        avg_detections = np.mean(self.detection_counts) if self.detection_counts else 0
-        max_detections = max(self.detection_counts) if self.detection_counts else 0
+        # Separate by result
+        entries = [t for t in self.completed_tracks if t.get('direction') == 'IN']
+        exits = [t for t in self.completed_tracks if t.get('direction') == 'OUT']
+        abandoned = [t for t in self.completed_tracks if t.get('direction') is None]
         
         report = {
-            'session_info': {
-                'runtime_seconds': round(runtime, 1),
-                'runtime_formatted': f"{int(runtime // 60)}m {int(runtime % 60)}s",
-                'total_frames': self.frame_count,
-                'average_fps': round(avg_fps, 1),
-                'timestamp': datetime.now().isoformat()
-            },
-            'detection_stats': {
-                'avg_people_per_frame': round(avg_detections, 2),
-                'max_simultaneous_people': max_detections,
-                'total_tracks_analyzed': len(self.completed_tracks)
-            },
-            'counting_summary': {
-                'total_entries': len(entries),
-                'total_exits': len(exits),
-                'abandoned_tracks': len(abandoned),
-                'final_occupancy': len(entries) - len(exits)
-            },
-            'confidence_breakdown': {
-                'high_confidence': len(high_conf),
-                'medium_confidence': len(med_conf),
-                'low_confidence': len(low_conf),
-                'high_confidence_pct': round(100 * len(high_conf) / max(len(entries) + len(exits), 1), 1)
-            },
-            'entry_patterns': self._analyze_pattern(entries, 'ENTRY'),
-            'exit_patterns': self._analyze_pattern(exits, 'EXIT'),
-            'abandoned_patterns': self._analyze_pattern(abandoned, 'ABANDONED'),
-            'recommended_thresholds': self._calculate_recommended_thresholds()
+            'runtime_seconds': elapsed,
+            'total_frames': self.frame_count,
+            'fps': self.frame_count / elapsed if elapsed > 0 else 0,
+            'total_tracks': len(self.completed_tracks),
+            'entries': len(entries),
+            'exits': len(exits),
+            'abandoned': len(abandoned),
+            'avg_detection_count': np.mean(self.detection_counts) if self.detection_counts else 0,
+            'max_detection_count': max(self.detection_counts) if self.detection_counts else 0,
         }
+        
+        # Analyze entry patterns
+        if entries:
+            report['entry_spawn_y_mean'] = np.mean([t['spawn_y'] for t in entries])
+            report['entry_spawn_y_std'] = np.std([t['spawn_y'] for t in entries])
+            report['entry_final_y_mean'] = np.mean([t.get('last_y', 0.5) for t in entries])
+        
+        if exits:
+            report['exit_spawn_y_mean'] = np.mean([t['spawn_y'] for t in exits])
+            report['exit_spawn_y_std'] = np.std([t['spawn_y'] for t in exits])
+            report['exit_final_y_mean'] = np.mean([t.get('last_y', 0.5) for t in exits])
+        
+        # Recommend thresholds
+        if entries and exits:
+            all_entry_spawn = [t['spawn_y'] for t in entries]
+            all_exit_spawn = [t['spawn_y'] for t in exits]
+            all_final_y = [t.get('last_y', 0.5) for t in entries + exits]
+            
+            report['recommended'] = {
+                'near_edge_threshold': float(np.percentile(all_final_y, 85)),
+                'spawn_far_threshold': float(np.percentile(all_entry_spawn, 75)),
+                'spawn_near_threshold': float(np.percentile(all_exit_spawn, 25)),
+            }
         
         return report
     
     def print_report(self, report: dict):
-        """Print formatted diagnostic report to console"""
-        print("\n" + "="*70)
-        print("                    DIAGNOSTIC REPORT")
-        print("="*70)
+        """Print formatted report"""
+        print("\n" + "=" * 60)
+        print("  DIAGNOSTIC REPORT")
+        print("=" * 60)
+        print(f"\n  Runtime: {report['runtime_seconds']:.1f}s")
+        print(f"  Frames: {report['total_frames']} ({report['fps']:.1f} FPS)")
+        print(f"  Total tracks: {report['total_tracks']}")
+        print(f"  Entries: {report['entries']}")
+        print(f"  Exits: {report['exits']}")
+        print(f"  Abandoned: {report['abandoned']}")
+        print(f"  Avg detections/frame: {report['avg_detection_count']:.1f}")
+        print(f"  Max detections/frame: {report['max_detection_count']}")
         
-        # Session Info
-        info = report.get('session_info', {})
-        print(f"\n📊 SESSION INFO")
-        print(f"   Runtime: {info.get('runtime_formatted', 'N/A')}")
-        print(f"   Frames processed: {info.get('total_frames', 0):,}")
-        print(f"   Average FPS: {info.get('average_fps', 0)}")
+        if 'entry_spawn_y_mean' in report:
+            print(f"\n  Entry spawn Y: {report['entry_spawn_y_mean']:.3f} +/- {report['entry_spawn_y_std']:.3f}")
+            print(f"  Entry final Y: {report['entry_final_y_mean']:.3f}")
         
-        # Detection Stats
-        det = report.get('detection_stats', {})
-        print(f"\n👁 DETECTION STATS")
-        print(f"   Avg people per frame: {det.get('avg_people_per_frame', 0)}")
-        print(f"   Max simultaneous: {det.get('max_simultaneous_people', 0)}")
-        print(f"   Total tracks analyzed: {det.get('total_tracks_analyzed', 0)}")
+        if 'exit_spawn_y_mean' in report:
+            print(f"  Exit spawn Y: {report['exit_spawn_y_mean']:.3f} +/- {report['exit_spawn_y_std']:.3f}")
+            print(f"  Exit final Y: {report['exit_final_y_mean']:.3f}")
         
-        # Counting Summary
-        count = report.get('counting_summary', {})
-        print(f"\n🚶 COUNTING SUMMARY")
-        print(f"   Entries: {count.get('total_entries', 0)}")
-        print(f"   Exits: {count.get('total_exits', 0)}")
-        print(f"   Abandoned: {count.get('abandoned_tracks', 0)}")
-        print(f"   Final occupancy: {count.get('final_occupancy', 0)}")
+        if 'recommended' in report:
+            rec = report['recommended']
+            print(f"\n  RECOMMENDED THRESHOLDS:")
+            print(f"    near_edge_threshold: {rec['near_edge_threshold']:.3f}")
+            print(f"    spawn_far_threshold: {rec['spawn_far_threshold']:.3f}")
+            print(f"    spawn_near_threshold: {rec['spawn_near_threshold']:.3f}")
         
-        # Confidence
-        conf = report.get('confidence_breakdown', {})
-        print(f"\n✅ CONFIDENCE BREAKDOWN")
-        print(f"   HIGH:   {conf.get('high_confidence', 0)}")
-        print(f"   MEDIUM: {conf.get('medium_confidence', 0)}")
-        print(f"   LOW:    {conf.get('low_confidence', 0)}")
-        print(f"   High confidence rate: {conf.get('high_confidence_pct', 0)}%")
-        
-        # Entry Patterns
-        entry = report.get('entry_patterns', {})
-        if entry.get('count', 0) > 0:
-            print(f"\n📥 ENTRY PATTERNS (n={entry['count']})")
-            print(f"   Spawn Y:      {entry['spawn_y']['mean']:.2f} ± {entry['spawn_y']['std']:.2f}")
-            print(f"   Terminate Y:  {entry['termination_y']['mean']:.2f} ± {entry['termination_y']['std']:.2f}")
-            print(f"   Area ratio:   {entry['area_ratio']['mean']:.2f} ± {entry['area_ratio']['std']:.2f}")
-            print(f"   Duration:     {entry['duration_frames']['mean']:.0f} frames (range: {entry['duration_frames']['min']}-{entry['duration_frames']['max']})")
-        
-        # Exit Patterns
-        exit_p = report.get('exit_patterns', {})
-        if exit_p.get('count', 0) > 0:
-            print(f"\n📤 EXIT PATTERNS (n={exit_p['count']})")
-            print(f"   Spawn Y:      {exit_p['spawn_y']['mean']:.2f} ± {exit_p['spawn_y']['std']:.2f}")
-            print(f"   Terminate Y:  {exit_p['termination_y']['mean']:.2f} ± {exit_p['termination_y']['std']:.2f}")
-            print(f"   Area ratio:   {exit_p['area_ratio']['mean']:.2f} ± {exit_p['area_ratio']['std']:.2f}")
-            print(f"   Duration:     {exit_p['duration_frames']['mean']:.0f} frames (range: {exit_p['duration_frames']['min']}-{exit_p['duration_frames']['max']})")
-        
-        # Recommendations
-        rec = report.get('recommended_thresholds', {})
-        if rec:
-            print(f"\n⚙️ RECOMMENDED THRESHOLDS")
-            for key, value in rec.items():
-                print(f"   {key}: {value:.3f}" if isinstance(value, float) else f"   {key}: {value}")
-        
-        print("\n" + "="*70)
+        print("=" * 60 + "\n")
     
-    def generate_plots(self, output_path: str = 'diagnostic_plots.png') -> bool:
-        """Generate visualization plots. Returns True if successful."""
+    def generate_plots(self, output_path: str = "diagnostics.png") -> bool:
+        """Generate diagnostic plots"""
         if not HAS_MATPLOTLIB:
-            print("⚠️ matplotlib not installed - skipping plots")
+            print("matplotlib not available, skipping plots")
             return False
         
-        if not self.completed_tracks:
-            print("⚠️ No data to plot")
-            return False
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig.suptitle('People Counter Diagnostics', fontsize=14)
         
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        entries = [t for t in self.completed_tracks if t.get('direction') == 'IN']
+        exits = [t for t in self.completed_tracks if t.get('direction') == 'OUT']
+        abandoned = [t for t in self.completed_tracks if t.get('direction') is None]
         
-        entries = [t for t in self.completed_tracks if t['direction'] == 'IN']
-        exits = [t for t in self.completed_tracks if t['direction'] == 'OUT']
-        abandoned = [t for t in self.completed_tracks if t['direction'] is None]
-        
-        # Plot 1: Spawn vs Termination positions
+        # Plot 1: Spawn Y distribution
         ax = axes[0, 0]
         if entries:
-            ax.scatter([t['spawn_y'] for t in entries], 
-                      [t['termination_y'] for t in entries],
-                      c='green', label=f'Entry (n={len(entries)})', alpha=0.6, s=50)
+            ax.hist([t['spawn_y'] for t in entries], bins=20, alpha=0.6, label='Entry', color='green')
         if exits:
-            ax.scatter([t['spawn_y'] for t in exits],
-                      [t['termination_y'] for t in exits],
-                      c='red', label=f'Exit (n={len(exits)})', alpha=0.6, s=50)
-        if abandoned:
-            ax.scatter([t['spawn_y'] for t in abandoned],
-                      [t['termination_y'] for t in abandoned],
-                      c='gray', label=f'Abandoned (n={len(abandoned)})', alpha=0.4, s=30)
-        ax.set_xlabel('Spawn Y (0=top, 1=bottom)')
-        ax.set_ylabel('Termination Y')
-        ax.set_title('Track Start vs End Position')
+            ax.hist([t['spawn_y'] for t in exits], bins=20, alpha=0.6, label='Exit', color='red')
+        ax.set_xlabel('Spawn Y (normalized)')
+        ax.set_title('Spawn Y Distribution')
         ax.legend()
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.grid(True, alpha=0.3)
         
-        # Plot 2: Area ratio distribution
+        # Plot 2: Final Y distribution
         ax = axes[0, 1]
         if entries:
-            ax.hist([t['area_ratio'] for t in entries], bins=15, alpha=0.6, 
-                   label='Entry', color='green')
+            ax.hist([t.get('last_y', 0.5) for t in entries], bins=20, alpha=0.6, label='Entry', color='green')
         if exits:
-            ax.hist([t['area_ratio'] for t in exits], bins=15, alpha=0.6,
-                   label='Exit', color='red')
-        ax.axvline(x=1.0, color='black', linestyle='--', label='No change')
-        ax.set_xlabel('Area Ratio (final/initial)')
-        ax.set_ylabel('Count')
-        ax.set_title('Bounding Box Area Change')
+            ax.hist([t.get('last_y', 0.5) for t in exits], bins=20, alpha=0.6, label='Exit', color='red')
+        ax.set_xlabel('Final Y (normalized)')
+        ax.set_title('Final Y Distribution')
         ax.legend()
-        ax.grid(True, alpha=0.3)
         
-        # Plot 3: Track duration distribution
+        # Plot 3: Track duration
         ax = axes[0, 2]
-        all_durations = [t['duration_frames'] for t in self.completed_tracks]
-        colors = ['green' if t['direction'] == 'IN' else 'red' if t['direction'] == 'OUT' else 'gray' 
-                  for t in self.completed_tracks]
-        ax.bar(range(len(all_durations)), all_durations, color=colors, alpha=0.7)
-        ax.set_xlabel('Track Index')
-        ax.set_ylabel('Duration (frames)')
-        ax.set_title('Track Durations')
-        ax.grid(True, alpha=0.3)
+        durations = [t.get('duration_ms', t['frame_count'] * 33) for t in self.completed_tracks if t.get('direction')]
+        if durations:
+            ax.hist(durations, bins=30, alpha=0.6, color='blue')
+        ax.set_xlabel('Duration (ms)')
+        ax.set_title('Track Duration')
         
-        # Plot 4: Y-travel vs Area ratio
+        # Plot 4: Area change
         ax = axes[1, 0]
-        valid_tracks = [t for t in self.completed_tracks if t['direction']]
-        if valid_tracks:
-            colors = ['green' if t['direction'] == 'IN' else 'red' for t in valid_tracks]
-            ax.scatter([t['y_travel'] for t in valid_tracks],
-                      [t['area_ratio'] for t in valid_tracks],
-                      c=colors, alpha=0.6, s=50)
-        ax.axhline(y=1.0, color='black', linestyle='--', alpha=0.5)
-        ax.set_xlabel('Y Travel (normalized)')
+        for t in entries[:20]:
+            if t['area_history']:
+                areas = np.array(t['area_history']) / t['spawn_area']
+                ax.plot(areas, alpha=0.4, color='green')
+        for t in exits[:20]:
+            if t['area_history']:
+                areas = np.array(t['area_history']) / t['spawn_area']
+                ax.plot(areas, alpha=0.4, color='red')
+        ax.set_xlabel('Frame')
         ax.set_ylabel('Area Ratio')
-        ax.set_title('Movement vs Size Change')
-        ax.grid(True, alpha=0.3)
+        ax.set_title('Area Change (green=IN, red=OUT)')
+        ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
         
         # Plot 5: Detections over time
         ax = axes[1, 1]
         if self.detection_counts:
-            ax.plot(self.detection_counts, 'b-', alpha=0.7, linewidth=0.5)
             ax.fill_between(range(len(self.detection_counts)), self.detection_counts, alpha=0.3)
             ax.set_xlabel('Frame')
             ax.set_ylabel('People Detected')
@@ -459,7 +316,7 @@ class TrackAnalyzer:
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"📈 Plots saved to {output_path}")
+        print(f"  Plots saved to {output_path}")
         return True
 
 
@@ -483,21 +340,21 @@ class PeopleCounterConfig:
     camera_source: str = CAMERA_SOURCE
     
     # YOLOv8 settings
-    model_path: str = "yolov8s.pt"  # Use 'yolov8s' for better accuracy
+    model_path: str = "yolov8s.pt"
     detection_confidence: float = DETECTION_CONFIDENCE
-    nms_iou_threshold: float = 0.7     # Prevent box merging for groups
-    person_class_id: int = 0           # COCO class ID for 'person'
+    nms_iou_threshold: float = 0.7
+    person_class_id: int = 0
     
     # Frame processing
     frame_width: int = 640
     frame_height: int = 480
-    process_every_n_frames: int = 1    # Process every frame for accuracy
+    process_every_n_frames: int = 1
     
     # ByteTrack settings
     track_high_thresh: float = 0.5
     track_low_thresh: float = 0.1
     new_track_thresh: float = 0.6
-    track_buffer: int = 30             # Frames to keep lost tracks
+    track_buffer: int = 30
     match_thresh: float = 0.8
     
     # Direction detector config (passed through)
@@ -512,7 +369,7 @@ class PeopleCounterConfig:
         crossing_hysteresis=CROSSING_HYSTERESIS
     ))
     
-    # Standby slot settings - uses QUICK CONFIG value
+    # Standby slot settings
     standby_timeout_seconds: float = STANDBY_TIMEOUT_SECONDS
     
     # Visualization
@@ -522,23 +379,23 @@ class PeopleCounterConfig:
     
     # Output
     log_events: bool = True
-    output_file: Optional[str] = None  # JSON file to log events
+    output_file: Optional[str] = None
     
     # Diagnostics
-    enable_diagnostics: bool = True    # Collect data for diagnostic report
-    diagnostics_output_dir: str = "."  # Where to save diagnostic files
-    generate_plots: bool = True        # Generate diagnostic plots on exit
+    enable_diagnostics: bool = True
+    diagnostics_output_dir: str = "."
+    generate_plots: bool = True
     
-    # Sensor Fusion (ESP32 radar/ToF integration)
-    enable_fusion: bool = False              # Enable sensor fusion with ESP32
-    fusion_port: str = "COM3"                # ESP32 serial port (COM3 on Windows, /dev/ttyUSB0 on Linux)
-    fusion_strategy: str = "confirmation"    # 'confirmation', 'tiebreaker', or 'crossing'
-    fusion_confidence_threshold: float = 0.5 # Min confidence to count after fusion
+    # Sensor Fusion v2 (ESP32 ToF integration)
+    enable_fusion: bool = False
+    fusion_port: str = "COM3"
+    fusion_strategy: str = "dual_zone"   # 'confirmation', 'dual_zone', or 'hybrid'
+    fusion_confidence_threshold: float = 0.5
     
     # Direction flip - swap IN/OUT
-    flip_direction: bool = FLIP_DIRECTION    # True = IN becomes OUT, OUT becomes IN
+    flip_direction: bool = FLIP_DIRECTION
     
-    # Calibration mode - shows raw sensor data for coordinate mapping
+    # Calibration mode
     calibrate_mode: bool = False
 
 
@@ -550,83 +407,73 @@ class ByteTrackWrapper:
     
     def __init__(self, config: PeopleCounterConfig):
         self.config = config
-        # ByteTrack config for ultralytics
-        self.tracker_config = {
-            'tracker_type': 'bytetrack',
-            'track_high_thresh': config.track_high_thresh,
-            'track_low_thresh': config.track_low_thresh,
-            'new_track_thresh': config.new_track_thresh,
-            'track_buffer': config.track_buffer,
-            'match_thresh': config.match_thresh
-        }
+        self.model = YOLO(config.model_path)
+    
+    def track_frame(self, frame: np.ndarray) -> List[Tuple[int, Tuple[float, float, float, float]]]:
+        """Track people in frame, returns list of (track_id, bbox)"""
+        results = self.model.track(
+            frame,
+            persist=True,
+            classes=[self.config.person_class_id],
+            conf=self.config.detection_confidence,
+            iou=self.config.nms_iou_threshold,
+            tracker="bytetrack.yaml",
+            verbose=False
+        )
+        
+        detections = []
+        if results and len(results) > 0 and results[0].boxes is not None \
+           and results[0].boxes.id is not None:
+            boxes = results[0].boxes
+            for i, (box, track_id) in enumerate(zip(boxes.xyxy, boxes.id)):
+                x1, y1, x2, y2 = box.cpu().numpy()
+                tid = int(track_id.cpu().numpy())
+                detections.append((tid, (float(x1), float(y1), float(x2), float(y2))))
+        
+        return detections
 
 
 class PeopleCounter:
     """
-    Main people counting system.
-    
-    Workflow:
-    1. Capture frame from camera
-    2. Run YOLOv8 detection (person class only)
-    3. Track detections with ByteTrack
-    4. Feed tracks to DirectionDetector
-    5. Update unique visitor count with Standby Slot Method
+    Main people counter integrating all components.
     """
     
-    def __init__(self, config: Optional[PeopleCounterConfig] = None):
+    def __init__(self, config: PeopleCounterConfig = None):
         self.config = config or PeopleCounterConfig()
         
-        # Initialize YOLO model
-        logger.info(f"Loading YOLO model: {self.config.model_path}")
-        self.model = YOLO(self.config.model_path)
-        
-        # Initialize direction detector
-        self.config.direction_config.frame_width = self.config.frame_width
-        self.config.direction_config.frame_height = self.config.frame_height
+        # Core components
+        self.tracker = ByteTrackWrapper(self.config)
         self.direction_detector = DirectionDetector(self.config.direction_config)
         
-        # Initialize diagnostics analyzer
-        self.analyzer: Optional[TrackAnalyzer] = None
-        if self.config.enable_diagnostics:
-            self.analyzer = TrackAnalyzer()
-            logger.info("Diagnostics enabled - will generate report on exit")
-        
-        # Standby slots for unique visitor counting
-        self.standby_slots: Deque[StandbySlot] = deque()
+        # Standby Slot Method state
         self.unique_visitors = 0
+        self.standby_slots: Deque[StandbySlot] = deque()
         
-        # Video capture
-        self.cap: Optional[cv2.VideoCapture] = None
-        
-        # Event log
-        self.events: List[dict] = []
-        
-        # Track management for analyzer
-        self.active_track_ids: set = set()
-        
-        # Performance tracking
+        # Frame processing state
+        self.cap = None
         self.frame_count = 0
-        self.fps_history: Deque[float] = deque(maxlen=30)
-        self.last_frame_time = time.time()
-        
-        # State
+        self.events: List[dict] = []
+        self.active_track_ids: set = set()
         self.running = False
         
-        # Sensor fusion engine (optional - for ESP32 radar/ToF)
+        # Diagnostics
+        self.analyzer = TrackAnalyzer() if self.config.enable_diagnostics else None
+        
+        # Sensor fusion v2 engine (optional - for ESP32 ToF integration)
         self.fusion_engine: Optional['SensorFusionEngine'] = None
         if HAS_FUSION and self.config.enable_fusion:
-            self.fusion_engine = SensorFusionEngine(
+            fusion_config = FusionConfig(
                 port=self.config.fusion_port,
                 strategy=self.config.fusion_strategy,
-                flip_direction=self.config.flip_direction
             )
-            logger.info(f"Sensor fusion initialized: {self.config.fusion_strategy} on {self.config.fusion_port}")
+            self.fusion_engine = SensorFusionEngine(fusion_config)
+            logger.info(f"Sensor fusion v2 initialized: {self.config.fusion_strategy} "
+                       f"on {self.config.fusion_port}")
     
     def start(self):
         """Initialize video capture and start processing"""
         source = self.config.camera_source
         
-        # Parse camera source
         if source.isdigit():
             source = int(source)
         
@@ -636,7 +483,6 @@ class PeopleCounter:
         if not self.cap.isOpened():
             raise RuntimeError(f"Failed to open video source: {source}")
         
-        # Set resolution
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
         
@@ -644,7 +490,6 @@ class PeopleCounter:
         actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         logger.info(f"Video resolution: {actual_width}x{actual_height}")
         
-        # Update config with actual resolution
         self.config.frame_width = actual_width
         self.config.frame_height = actual_height
         self.config.direction_config.frame_width = actual_width
@@ -655,22 +500,28 @@ class PeopleCounter:
         
         # Start sensor fusion if enabled
         if self.fusion_engine:
-            self.fusion_engine.start()
-            logger.info("Sensor fusion engine started")
-            
-            # Start calibration mode if configured
-            if self.config.calibrate_mode:
-                self.fusion_engine.start_calibration()
-                logger.info("Calibration mode started")
+            if self.fusion_engine.start():
+                logger.info("Sensor fusion v2 engine started")
+                
+                # Apply initial flip state
+                if self.config.flip_direction:
+                    self.fusion_engine.set_flip(True)
+                
+                # Start calibration mode if configured
+                if self.config.calibrate_mode:
+                    self.fusion_engine.start_calibration()
+                    logger.info("Calibration mode started")
+            else:
+                logger.warning("Failed to start sensor fusion - running camera-only")
+                self.fusion_engine = None
     
     def stop(self):
         """Stop processing and release resources"""
         self.running = False
         
-        # Stop sensor fusion if enabled
         if self.fusion_engine:
             self.fusion_engine.stop()
-            logger.info("Sensor fusion engine stopped")
+            logger.info("Sensor fusion v2 engine stopped")
         
         if self.cap:
             self.cap.release()
@@ -678,95 +529,50 @@ class PeopleCounter:
         
         # Generate diagnostic report
         if self.analyzer:
-            print("\n⏳ Generating diagnostic report...")
+            print("\n  Generating diagnostic report...")
             report = self.analyzer.generate_report()
-            
-            # Print to console
             self.analyzer.print_report(report)
             
-            # Save JSON report
             output_dir = Path(self.config.diagnostics_output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            report_path = output_dir / f'diagnostic_report_{timestamp}.json'
+            report_path = output_dir / f"diagnostics_{timestamp}.json"
             with open(report_path, 'w') as f:
                 json.dump(report, f, indent=2, default=str)
-            print(f"📄 Report saved to {report_path}")
+            print(f"  Report saved to {report_path}")
             
-            # Generate plots
             if self.config.generate_plots:
-                plots_path = output_dir / f'diagnostic_plots_{timestamp}.png'
-                self.analyzer.generate_plots(str(plots_path))
-            
-            # Store report for programmatic access
-            self.diagnostic_report = report
+                plot_path = output_dir / f"diagnostics_{timestamp}.png"
+                self.analyzer.generate_plots(str(plot_path))
         
-        # Save events if configured
+        # Save events log
         if self.config.output_file and self.events:
+            entries, exits, occupancy = self.direction_detector.get_counts()
+            output = {
+                'events': self.events,
+                'summary': {
+                    'total_entries': entries,
+                    'total_exits': exits,
+                    'unique_visitors': self.unique_visitors,
+                    'current_occupancy': occupancy
+                }
+            }
             with open(self.config.output_file, 'w') as f:
-                json.dump({
-                    'events': self.events,
-                    'summary': {
-                        'total_entries': self.direction_detector.entry_count,
-                        'total_exits': self.direction_detector.exit_count,
-                        'unique_visitors': self.unique_visitors,
-                        'current_occupancy': self.get_current_occupancy()
-                    }
-                }, f, indent=2)
-            logger.info(f"Events saved to {self.config.output_file}")
+                json.dump(output, f, indent=2, default=str)
+            print(f"  Events saved to {self.config.output_file}")
         
         logger.info("People counter stopped")
     
-    def process_frame(self) -> Tuple[Optional[np.ndarray], List[dict]]:
-        """
-        Process a single frame and return visualization + events.
-        
-        Returns:
-            (frame_with_visualization, list_of_crossing_events)
-        """
-        if not self.cap or not self.running:
-            return None, []
-        
-        ret, frame = self.cap.read()
-        if not ret:
-            return None, []
-        
+    def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[dict]]:
+        """Process a single frame"""
         self.frame_count += 1
         current_time = time.time()
         
-        # Calculate FPS
-        frame_time = current_time - self.last_frame_time
-        self.fps_history.append(1.0 / max(frame_time, 0.001))
-        self.last_frame_time = current_time
-        
-        # Skip frames if configured
-        if self.frame_count % self.config.process_every_n_frames != 0:
-            return frame, []
-        
-        # Run YOLO with tracking
-        results = self.model.track(
-            frame,
-            persist=True,
-            conf=self.config.detection_confidence,
-            iou=self.config.nms_iou_threshold,
-            classes=[self.config.person_class_id],
-            verbose=False,
-            tracker="bytetrack.yaml"
-        )
-        
-        # Extract tracked detections
-        detections = []
-        current_track_ids = set()
-        
-        if results and results[0].boxes is not None and results[0].boxes.id is not None:
-            boxes = results[0].boxes
-            for i, (box, track_id) in enumerate(zip(boxes.xyxy, boxes.id)):
-                x1, y1, x2, y2 = box.cpu().numpy()
-                tid = int(track_id.cpu().numpy())
-                detections.append((tid, (float(x1), float(y1), float(x2), float(y2))))
-                current_track_ids.add(tid)
+        # Run tracker
+        detections = self.tracker.track_frame(frame)
+        current_track_ids = set(tid for tid, _ in detections)
         
         # Record frame data for diagnostics
         if self.analyzer:
@@ -779,7 +585,6 @@ class PeopleCounter:
         for event in crossing_events:
             self._handle_crossing_event(event, current_time)
             
-            # Record completed track in analyzer
             if self.analyzer:
                 self.analyzer.finalize_track(
                     event['track_id'],
@@ -794,11 +599,14 @@ class PeopleCounter:
                 self.events.append(event)
                 logger.info(f"Crossing: {event['direction']} (confidence: {event['confidence']})")
         
+        # Check for ToF-only events (camera missed, ToF detected)
+        if self.fusion_engine and not crossing_events:
+            self.fusion_engine.check_tof_only_events()
+        
         # Track terminated tracks (for analyzer)
         if self.analyzer:
             terminated = self.active_track_ids - current_track_ids
             for tid in terminated:
-                # Check if it wasn't already finalized as a crossing
                 if tid not in [e['track_id'] for e in crossing_events]:
                     self.analyzer.finalize_track(tid, None, None)
         
@@ -816,7 +624,7 @@ class PeopleCounter:
     def _handle_crossing_event(self, event: dict, current_time: float):
         """
         Apply Standby Slot Method to handle crossing events.
-        Uses sensor fusion if enabled for improved accuracy.
+        Uses sensor fusion v2 if enabled for improved accuracy.
         
         Rules:
         - EXIT at occupancy > 0: Create a standby slot
@@ -825,9 +633,8 @@ class PeopleCounter:
         - ENTRY without standby: New unique visitor
         """
         direction = event['direction']
-        trigger = event.get('trigger', 'unknown')  # 'threshold_crossing' or 'track_termination'
+        trigger = event.get('trigger', 'unknown')
         
-        # Log the crossing event with trigger type
         logger.info(f"Crossing: {direction} (conf={event.get('confidence', '?')}, "
                    f"trigger={trigger}, track={event['track_id']})")
         
@@ -835,16 +642,10 @@ class PeopleCounter:
         if self.config.flip_direction:
             direction = 'OUT' if direction == 'IN' else 'IN'
         
-        # Use sensor fusion if enabled
+        # Use sensor fusion v2 if enabled
         if self.fusion_engine:
-            # Get track history for trend data
-            track_history = get_track_history_for_event(
-                self.direction_detector, 
-                event['track_id']
-            )
-            
-            # Create camera event for fusion
-            camera_event = create_camera_event_from_detector_event(event, track_history)
+            # Create camera event using v2 helper (simpler - no track_history needed)
+            camera_event = create_camera_event(event)
             
             # Apply flip to camera event too
             if self.config.flip_direction:
@@ -854,8 +655,7 @@ class PeopleCounter:
             decision = self.fusion_engine.process_camera_event(camera_event)
             
             if decision is None:
-                # Crossing strategy returned None (waiting for sensor confirmation)
-                logger.debug(f"Track {event['track_id']}: Waiting for sensor confirmation")
+                logger.debug(f"Track {event['track_id']}: Fusion returned None (waiting/rejected)")
                 return
             
             if decision.confidence < self.config.fusion_confidence_threshold:
@@ -863,37 +663,31 @@ class PeopleCounter:
                               f"({decision.confidence:.2f}), skipping")
                 return
             
-            # Use fused direction
+            # Use fused direction and log decision source
             direction = decision.direction
             logger.info(f"Fusion decision: {direction} (conf={decision.confidence:.2f}, "
-                       f"src={decision.source})")
+                       f"src={decision.source}, tof_conf={decision.tof_confidence:.2f})")
         
         # Get current occupancy for negative occupancy check
         _, _, occupancy = self.direction_detector.get_counts()
         
         # Apply Standby Slot Method with negative occupancy fix
         if direction == 'OUT':
-            # Check if occupancy is already 0 (person wasn't counted on entry)
             if occupancy <= 0:
-                # This person was inside but never counted!
-                # Add them to unique visitors AND create standby slot
+                # Person was inside but never counted on entry
                 self.unique_visitors += 1
                 logger.info(f"Uncounted exit detected! Added unique visitor #{self.unique_visitors}")
             
-            # Always create standby slot on exit
-            slot = StandbySlot(created_time=current_time, 
+            slot = StandbySlot(created_time=current_time,
                               timeout_seconds=self.config.standby_timeout_seconds)
             self.standby_slots.append(slot)
             logger.debug(f"Created standby slot (total: {len(self.standby_slots)})")
             
         elif direction == 'IN':
-            # Person entering - check for standby slot
             if self.standby_slots:
-                # Consume oldest standby slot (returning person)
                 self.standby_slots.popleft()
                 logger.debug(f"Consumed standby slot (remaining: {len(self.standby_slots)})")
             else:
-                # No standby slot - new unique visitor
                 self.unique_visitors += 1
                 logger.info(f"New unique visitor #{self.unique_visitors}")
     
@@ -902,105 +696,78 @@ class PeopleCounter:
         while self.standby_slots and self.standby_slots[0].is_expired(current_time):
             self.standby_slots.popleft()
     
-    def _draw_visualization(self, frame: np.ndarray, 
+    def _draw_visualization(self, frame: np.ndarray,
                            detections: List[Tuple[int, Tuple[float, float, float, float]]],
                            events: List[dict]) -> np.ndarray:
         """Draw debug visualization on frame"""
         
         # Draw detection zone indicator (near-edge threshold)
         near_edge_y = int(self.config.direction_config.near_edge_threshold * self.config.frame_height)
-        cv2.line(frame, (0, near_edge_y), (self.config.frame_width, near_edge_y), 
+        cv2.line(frame, (0, near_edge_y), (self.config.frame_width, near_edge_y),
                  (0, 255, 255), 2)
         cv2.putText(frame, "DOOR THRESHOLD", (10, near_edge_y - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         
-        # Draw bounding boxes with track info
+        # Draw bounding boxes with track IDs
         for track_id, (x1, y1, x2, y2) in detections:
-            # Get track state for coloring
-            debug_info = self.direction_detector.get_debug_info(track_id)
+            color = (0, 255, 0)
             
-            if debug_info:
-                state = debug_info['state']
-                if state == 'APPROACHING':
-                    color = (0, 255, 0)  # Green - approaching
-                elif state == 'DEPARTING':
-                    color = (0, 0, 255)  # Red - departing
-                elif state == 'STABLE':
-                    color = (255, 255, 0)  # Cyan - stable
-                else:
-                    color = (128, 128, 128)  # Gray - nascent
-            else:
-                color = (255, 255, 255)  # White - unknown
+            # Check track state for color
+            state = self.direction_detector.get_track_state(track_id)
+            if state is not None:
+                from direction_detector import TrackState
+                if state == TrackState.APPROACHING:
+                    color = (0, 200, 0)
+                elif state == TrackState.DEPARTING:
+                    color = (0, 0, 200)
+                elif state in (TrackState.CROSSED_IN, TrackState.CROSSED_OUT):
+                    color = (200, 200, 0)
             
-            # Draw bbox
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-            
-            # Draw track ID and state
             label = f"ID:{track_id}"
-            if debug_info:
-                label += f" {debug_info['state'][:3]}"
-            cv2.putText(frame, label, (int(x1), int(y1) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
-            # Draw area trend indicator
-            if debug_info:
-                trend = debug_info['area_trend']
-                if trend == 'GROWING':
-                    cv2.arrowedLine(frame, (int(x2) + 10, int(y2)), 
-                                   (int(x2) + 10, int(y1)), (0, 255, 0), 2)
-                elif trend == 'SHRINKING':
-                    cv2.arrowedLine(frame, (int(x2) + 10, int(y1)), 
-                                   (int(x2) + 10, int(y2)), (0, 0, 255), 2)
+            cv2.putText(frame, label, (int(x1), int(y1) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         
-        # Draw crossing events
+        # Draw events
         for event in events:
             direction = event['direction']
-            confidence = event['confidence']
-            color = (0, 255, 0) if direction == 'IN' else (0, 0, 255)
-            text = f"{direction} ({confidence})"
-            cv2.putText(frame, text, (self.config.frame_width // 2 - 50, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
+            confidence = event.get('confidence', '?')
+            trigger = event.get('trigger', 'unknown')
+            
+            if direction == 'IN':
+                color = (0, 255, 0)
+                text = f">>> IN ({confidence})"
+            else:
+                color = (0, 0, 255)
+                text = f"<<< OUT ({confidence})"
+            
+            cv2.putText(frame, text, (10, 30 + len(events) * 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         
         # Draw stats overlay
-        if self.config.show_debug_overlay:
-            self._draw_stats_overlay(frame)
-        
-        return frame
-    
-    def _draw_stats_overlay(self, frame: np.ndarray):
-        """Draw statistics overlay"""
-        # Background for stats
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (250, 160), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-        
-        # Stats text
         entries, exits, occupancy = self.direction_detector.get_counts()
-        avg_fps = np.mean(self.fps_history) if self.fps_history else 0
-        
         stats = [
-            f"FPS: {avg_fps:.1f}",
+            f"FPS: {self.frame_count / max(1, time.time() - self.analyzer.start_time):.1f}" if self.analyzer else "",
             f"Entries: {entries}",
             f"Exits: {exits}",
             f"Occupancy: {occupancy}",
             f"Unique: {self.unique_visitors}",
-            f"Standby: {len(self.standby_slots)}"
+            f"Standby: {len(self.standby_slots)}",
         ]
         
-        y_offset = 30
-        for stat in stats:
-            cv2.putText(frame, stat, (20, y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-            y_offset += 22
-    
-    def get_current_occupancy(self) -> int:
-        """Get current number of people inside"""
-        _, _, occupancy = self.direction_detector.get_counts()
-        return max(0, occupancy)  # Don't go negative
-    
-    def get_unique_visitors(self) -> int:
-        """Get total unique visitors"""
-        return self.unique_visitors
+        # Fusion stats
+        if self.fusion_engine:
+            fusion_stats = self.fusion_engine.get_stats()
+            stats.append(f"Fusion: {fusion_stats.get('total', 0)} decisions")
+            stats.append(f"Avg conf: {fusion_stats.get('avg_confidence', 0):.2f}")
+        
+        y_offset = self.config.frame_height - 20 * len(stats) - 10
+        for i, stat in enumerate(stats):
+            if stat:
+                cv2.putText(frame, stat, (10, y_offset + i * 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        return frame
     
     def run(self):
         """Main processing loop"""
@@ -1008,13 +775,14 @@ class PeopleCounter:
         
         try:
             while self.running:
-                frame, events = self.process_frame()
-                
-                if frame is None:
+                ret, frame = self.cap.read()
+                if not ret or frame is None:
                     break
                 
+                # Process frame
+                frame, events = self.process_frame(frame)
+                
                 if self.config.show_visualization:
-                    # Scale if needed
                     if self.config.visualization_scale != 1.0:
                         new_size = (
                             int(frame.shape[1] * self.config.visualization_scale),
@@ -1029,13 +797,13 @@ class PeopleCounter:
                 if key == ord('q'):
                     break
                 elif key == ord('r'):
-                    # Reset counts
                     self.direction_detector.reset_counts()
                     self.unique_visitors = 0
                     self.standby_slots.clear()
+                    if self.fusion_engine:
+                        self.fusion_engine.reset_counts()
                     logger.info("Counts reset")
                 elif key == ord('s'):
-                    # Print current stats
                     entries, exits, occupancy = self.direction_detector.get_counts()
                     print(f"\n=== Current Stats ===")
                     print(f"Entries: {entries}")
@@ -1044,9 +812,10 @@ class PeopleCounter:
                     print(f"Unique Visitors: {self.unique_visitors}")
                     print(f"Standby Slots: {len(self.standby_slots)}")
                     print(f"Flip Direction: {self.config.flip_direction}")
+                    if self.fusion_engine:
+                        print(f"Fusion Stats: {self.fusion_engine.get_stats()}")
                     print(f"====================\n")
                 elif key == ord('c'):
-                    # Toggle calibration mode
                     self.config.calibrate_mode = not self.config.calibrate_mode
                     if self.fusion_engine:
                         if self.config.calibrate_mode:
@@ -1055,7 +824,6 @@ class PeopleCounter:
                             self.fusion_engine.stop_calibration()
                     print(f"Calibration mode: {'ON' if self.config.calibrate_mode else 'OFF'}")
                 elif key == ord('f'):
-                    # Toggle direction flip
                     self.config.flip_direction = not self.config.flip_direction
                     if self.fusion_engine:
                         self.fusion_engine.set_flip(self.config.flip_direction)
@@ -1066,10 +834,10 @@ class PeopleCounter:
 
 
 def main():
-    """Example usage"""
+    """Entry point with CLI argument parsing"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='People Counter with Direction Detection')
+    parser = argparse.ArgumentParser(description='People Counter with Direction Detection (v2)')
     parser.add_argument('--source', type=str, default=None,
                         help='Video source: 0 for webcam, URL for IP cam, or file path')
     parser.add_argument('--model', type=str, default='yolov8s.pt',
@@ -1089,14 +857,14 @@ def main():
     parser.add_argument('--no-plots', action='store_true',
                         help='Disable diagnostic plot generation')
     
-    # Sensor fusion arguments
+    # Sensor fusion v2 arguments
     parser.add_argument('--fusion', action='store_true',
-                        help='Enable sensor fusion with ESP32 (radar/ToF)')
+                        help='Enable sensor fusion v2 with ESP32 ToF')
     parser.add_argument('--fusion-port', type=str, default='COM3',
                         help='ESP32 serial port (default: COM3)')
-    parser.add_argument('--fusion-strategy', type=str, default='confirmation',
-                        choices=['confirmation', 'tiebreaker', 'crossing'],
-                        help='Fusion strategy: confirmation (default), tiebreaker, or crossing')
+    parser.add_argument('--fusion-strategy', type=str, default='dual_zone',
+                        choices=['confirmation', 'dual_zone', 'hybrid'],
+                        help='Fusion strategy: confirmation, dual_zone (default), or hybrid')
     
     # Direction and standby arguments
     parser.add_argument('--flip', action='store_true',
@@ -1129,8 +897,8 @@ def main():
     # Apply fusion settings
     if args.fusion:
         if not HAS_FUSION:
-            print("⚠️  WARNING: sensor_fusion.py not found. Fusion disabled.")
-            print("   Make sure sensor_fusion.py is in the same directory.")
+            print("  WARNING: sensor_fusion_v2.py not found. Fusion disabled.")
+            print("   Make sure sensor_fusion_v2.py is in the same directory.")
         else:
             config.enable_fusion = True
             config.fusion_port = args.fusion_port
@@ -1144,11 +912,11 @@ def main():
     if args.calibrate:
         config.calibrate_mode = True
     
-    print("="*60)
-    print("        PEOPLE COUNTER - Track Lifecycle Detection")
-    print("="*60)
-    print(f"\n📷 CAMERA SOURCE: {config.camera_source}")
-    print(f"\n⚙️  CURRENT THRESHOLDS:")
+    print("=" * 60)
+    print("    PEOPLE COUNTER v2.0 - Sensor Fusion v2 (ToF)")
+    print("=" * 60)
+    print(f"\n  CAMERA SOURCE: {config.camera_source}")
+    print(f"\n  CURRENT THRESHOLDS:")
     print(f"    detection_confidence:    {config.detection_confidence}")
     print(f"    near_edge_threshold:     {config.direction_config.near_edge_threshold}")
     print(f"    spawn_far_threshold:     {config.direction_config.spawn_far_threshold}")
@@ -1162,23 +930,23 @@ def main():
     print(f"    flip_direction:          {config.flip_direction}")
     
     if config.enable_fusion:
-        print(f"\n🔌 SENSOR FUSION ENABLED:")
+        print(f"\n  SENSOR FUSION v2 ENABLED:")
         print(f"    port:     {config.fusion_port}")
         print(f"    strategy: {config.fusion_strategy}")
         print(f"    threshold:{config.fusion_confidence_threshold}")
     
     if config.calibrate_mode:
-        print(f"\n🔧 CALIBRATION MODE: Watch console for CAL,... messages")
+        print(f"\n  CALIBRATION MODE: Watch console for CAL,... messages")
     
-    print(f"\n💡 Edit QUICK CONFIG at top of people_counter.py to change defaults")
-    print("="*60)
+    print(f"\n  Edit QUICK CONFIG at top of people_counter.py to change defaults")
+    print("=" * 60)
     print("  Controls:")
     print("    q - Quit and generate report")
     print("    r - Reset counts")
     print("    s - Show current stats")
     print("    c - Toggle calibration mode (sensor raw data)")
     print("    f - Toggle direction flip")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
     
     # Run counter
     counter = PeopleCounter(config)

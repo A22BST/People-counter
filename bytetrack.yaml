@@ -2,7 +2,7 @@
 # Optimized for doorway person tracking
 
 tracker_type: bytetrack
-
+fuse_score: True
 # Detection thresholds
 track_high_thresh: 0.5    # High confidence detection threshold
 track_low_thresh: 0.1     # Low confidence for second association
