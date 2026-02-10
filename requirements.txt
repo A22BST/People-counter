@@ -1,0 +1,17 @@
+# People Counter - Requirements
+# Tested with Python 3.9+
+
+# Core ML/CV
+ultralytics>=8.0.0          # YOLOv8 with built-in ByteTrack
+opencv-python>=4.8.0        # Video capture and visualization
+numpy>=1.24.0               # Numerical operations
+
+# Visualization and analysis
+matplotlib>=3.7.0           # Analysis plots
+
+# Optional: For MQTT integration (production)
+# paho-mqtt>=1.6.0
+
+# Optional: For Google Sheets logging (production)
+# gspread>=5.10.0
+# oauth2client>=4.1.3

@@ -1,0 +1,16 @@
+# ByteTrack configuration for People Counter
+# Optimized for doorway person tracking
+
+tracker_type: bytetrack
+
+# Detection thresholds
+track_high_thresh: 0.5    # High confidence detection threshold
+track_low_thresh: 0.1     # Low confidence for second association
+new_track_thresh: 0.6     # Threshold for creating new tracks
+
+# Track management
+track_buffer: 30          # Frames to keep lost tracks (1 second at 30fps)
+match_thresh: 0.8         # IOU threshold for matching
+
+# Frame rate (for motion prediction)
+frame_rate: 30
