@@ -44,27 +44,33 @@ from direction_detector import DirectionDetector, DirectionDetectorConfig, Track
 # ============================================================================
 
 # Camera source
-CAMERA_SOURCE = "http://192.168.1.5:4747/video"  # DroidCam default
+CAMERA_SOURCE = "0"  # DroidCam as webcam via USB
 
 # YOLO
 MODEL_PATH = "yolov8s.pt"
-CONFIDENCE = 0.3
+CONFIDENCE = 0.18  # Lower to keep weak/far detections for IN recall
 
 # Threshold crossing line position (0=top, 1=bottom)
 # This is WHERE the count triggers. Adjust based on your camera.
-NEAR_EDGE_THRESHOLD = 0.60
-CROSSING_HYSTERESIS = 0.03
+NEAR_EDGE_THRESHOLD = 0.55
+CROSSING_HYSTERESIS = 0.02
 
 # Evidence scoring thresholds (for confidence validation + fallback)
-SPAWN_FAR_THRESHOLD = 0.35
-SPAWN_NEAR_THRESHOLD = 0.65
+SPAWN_FAR_THRESHOLD = 0.40
+SPAWN_NEAR_THRESHOLD = 0.50      # Lower: classify IN even when first seen near threshold
 
-# Track requirements
-MIN_TRACK_DURATION_MS = 200
-MIN_TRACK_FRAMES = 4
+# Track requirements — lower to not miss quick behind-camera appearances
+MIN_TRACK_DURATION_MS = 100
+MIN_TRACK_FRAMES = 2
+MIN_SAMPLES_BEFORE_CROSSING = 1
+TRACK_TIMEOUT_MS = 900
+TERMINATION_MIN_Y_TRAVEL = 0.12
+MIN_BBOX_AREA_RATIO = 0.003
+AREA_GROWTH_FOR_APPROACH = 1.10
+AREA_SHRINK_FOR_DEPART = 0.90
 
 # Direction flip
-FLIP_DIRECTION = False
+FLIP_DIRECTION = True
 
 # ============================================================================
 
@@ -97,11 +103,11 @@ class PeopleCounter:
         print(f"Loading model: {model_path}")
         self.model = YOLO(model_path)
         
-        # ByteTrack
+        # ByteTrack — tuned for behind-camera appearances
         self.tracker = sv.ByteTrack(
-            track_activation_threshold=confidence,
-            lost_track_buffer=30,
-            minimum_matching_threshold=0.8,
+            track_activation_threshold=0.15,  # Lower: keep weak person detections
+            lost_track_buffer=60,             # Hold lost tracks longer through brief occlusion
+            minimum_matching_threshold=0.65,  # Looser matching to reduce ID drops
             frame_rate=30,
         )
         
@@ -113,18 +119,42 @@ class PeopleCounter:
             crossing_hysteresis=CROSSING_HYSTERESIS,
             spawn_far_threshold=SPAWN_FAR_THRESHOLD,
             spawn_near_threshold=SPAWN_NEAR_THRESHOLD,
+            area_growth_for_approach=AREA_GROWTH_FOR_APPROACH,
+            area_shrink_for_depart=AREA_SHRINK_FOR_DEPART,
             min_track_duration_ms=MIN_TRACK_DURATION_MS,
             min_track_frames=MIN_TRACK_FRAMES,
+            min_samples_before_crossing=MIN_SAMPLES_BEFORE_CROSSING,
+            track_timeout_ms=TRACK_TIMEOUT_MS,
+            termination_min_y_travel=TERMINATION_MIN_Y_TRAVEL,
+            min_bbox_area_ratio=MIN_BBOX_AREA_RATIO,
         )
         self.detector = DirectionDetector(config)
         
         print("=" * 50)
         print("HYBRID DETECTOR READY")
-        print(f"  Threshold line: {NEAR_EDGE_THRESHOLD:.0%} from top")
+        print(f"  Threshold line: {config.near_edge_threshold:.0%} from top")
         print(f"  Fallback: evidence scoring on termination")
         print("=" * 50)
         print("Q=Quit  R=Reset  D=Debug  F=Flip  S=Screenshot")
         print()
+
+    def _map_direction_for_display(self, direction: str) -> str:
+        if self.flip_direction:
+            return "OUT" if direction == "IN" else "IN"
+        return direction
+
+    def _get_display_stats(self) -> dict:
+        stats = self.detector.get_stats()
+        entries = stats["entries"]
+        exits = stats["exits"]
+        if self.flip_direction:
+            entries, exits = exits, entries
+        return {
+            "entries": entries,
+            "exits": exits,
+            "current_occupancy": max(0, entries - exits),
+            "active_tracks": stats["active_tracks"],
+        }
     
     def run(self):
         while True:
@@ -157,7 +187,7 @@ class PeopleCounter:
         
         self.cap.release()
         cv2.destroyAllWindows()
-        stats = self.detector.get_stats()
+        stats = self._get_display_stats()
         print(f"\nFinal: {stats['entries']} in, {stats['exits']} out, "
               f"occupancy: {stats['current_occupancy']}")
     
@@ -176,25 +206,41 @@ class PeopleCounter:
         
         # Build detection list for DirectionDetector
         det_list = []
+        raw_count = len(detections) if detections.xyxy is not None else 0
+        tracked_count = len(detections.tracker_id) if detections.tracker_id is not None and len(detections.tracker_id) > 0 else 0
+        
+        if raw_count > 0 or tracked_count > 0:
+            print(f"[FRAME] YOLO={raw_count} ByteTrack={tracked_count}")
+        
         if detections.tracker_id is not None and len(detections.tracker_id) > 0:
             for i, track_id in enumerate(detections.tracker_id):
                 if track_id is None:
                     continue
                 det_list.append((int(track_id), tuple(detections.xyxy[i])))
         
+        # === DIAGNOSTIC: print what's happening ===
+        if det_list:
+            for tid, bbox in det_list:
+                x1, y1, x2, y2 = bbox
+                cy_norm = ((y1 + y2) / 2) / self.frame_height
+                info = self.detector.get_track_info(tid)
+                tstate = info["threshold_state"] if info else "new"
+                crossed = info["has_crossed"] if info else False
+                print(f"  Track #{tid}: y={cy_norm:.2f} "
+                      f"threshold={self.detector.config.near_edge_threshold:.2f} "
+                      f"state={tstate} crossed={crossed}")
+        
         # Update detector
         events = self.detector.update(det_list)
         
         # Handle events
         for event in events:
-            direction = event["direction"]
-            if self.flip_direction:
-                direction = "OUT" if direction == "IN" else "IN"
+            direction = self._map_direction_for_display(event["direction"])
             
             conf = event["confidence"]
             tid = event["track_id"]
             trigger = event["trigger"]
-            stats = self.detector.get_stats()
+            stats = self._get_display_stats()
             
             arrow = "-> IN" if direction == "IN" else "<- OUT"
             evt_str = f"{arrow} #{tid} [{conf}] ({trigger[:5]}) | " \
@@ -211,11 +257,12 @@ class PeopleCounter:
     
     def _draw(self, frame: np.ndarray, detections: sv.Detections) -> np.ndarray:
         h, w = frame.shape[:2]
+        cfg = self.detector.config
         
         # === THRESHOLD LINE ===
-        threshold_y = int(NEAR_EDGE_THRESHOLD * h)
-        hyst_top = int((NEAR_EDGE_THRESHOLD - CROSSING_HYSTERESIS) * h)
-        hyst_bot = int((NEAR_EDGE_THRESHOLD + CROSSING_HYSTERESIS) * h)
+        threshold_y = int(cfg.near_edge_threshold * h)
+        hyst_top = int((cfg.near_edge_threshold - cfg.crossing_hysteresis) * h)
+        hyst_bot = int((cfg.near_edge_threshold + cfg.crossing_hysteresis) * h)
         
         # Hysteresis zone (subtle fill)
         overlay = frame.copy()
@@ -229,13 +276,13 @@ class PeopleCounter:
         
         if self.show_debug:
             # Spawn far line
-            far_y = int(SPAWN_FAR_THRESHOLD * h)
+            far_y = int(cfg.spawn_far_threshold * h)
             cv2.line(frame, (0, far_y), (w, far_y), (255, 180, 0), 1, cv2.LINE_AA)
             cv2.putText(frame, "spawn_far", (5, far_y - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 180, 0), 1)
             
             # Spawn near line
-            near_y = int(SPAWN_NEAR_THRESHOLD * h)
+            near_y = int(cfg.spawn_near_threshold * h)
             cv2.line(frame, (0, near_y), (w, near_y), (0, 180, 255), 1, cv2.LINE_AA)
             cv2.putText(frame, "spawn_near", (5, near_y - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 180, 255), 1)
@@ -300,7 +347,7 @@ class PeopleCounter:
                         cv2.circle(frame, (cx, ty), 2, tc, -1)
         
         # === STATS PANEL ===
-        stats = self.detector.get_stats()
+        stats = self._get_display_stats()
         fps = sum(self.fps_history) / max(len(self.fps_history), 1)
         
         panel_h = 130

@@ -64,7 +64,7 @@ class DirectionDetectorConfig:
     # === THRESHOLD CROSSING (primary trigger) ===
     near_edge_threshold: float = 0.60
     crossing_hysteresis: float = 0.03
-    min_samples_before_crossing: int = 3
+    min_samples_before_crossing: int = 2  # Fast trigger for behind-camera entries
     
     # === EVIDENCE SCORING (confidence validation) ===
     spawn_far_threshold: float = 0.35
