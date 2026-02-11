@@ -8,7 +8,7 @@ Records:
 - Timestamps for everything
 
 Usage:
-    python event_recorder.py --source 0 --fusion --fusion-port COM3 --output friday_prayer.json
+    python event_recorder.py --source 0 --fusion-port COM3 --output friday_prayer.json
 
 After event:
     python event_replay.py --input friday_prayer.json --compare-all
@@ -552,8 +552,8 @@ def main():
     parser = argparse.ArgumentParser(description='Record event data for offline analysis')
     parser.add_argument('--source', type=str, default='0',
                         help='Video source (0 for webcam, URL for IP cam)')
-    parser.add_argument('--output', type=str, required=True,
-                        help='Output JSON file path')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Output JSON file path (default: auto-generated timestamped filename)')
     parser.add_argument('--fusion-port', type=str, default=None,
                         help='ESP32 serial port (optional)')
     parser.add_argument('--model', type=str, default='yolov8s.pt',
@@ -568,6 +568,10 @@ def main():
                         help='Name of the event being recorded')
     
     args = parser.parse_args()
+
+    output_path = args.output or f"event_recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    if args.output is None:
+        print(f"No --output provided; using generated file: {output_path}")
     
     recorder = EventRecorder(
         source=args.source,
@@ -582,7 +586,7 @@ def main():
         recorder.recording.event_name = args.event_name
     
     recorder.run()
-    recorder.save(args.output)
+    recorder.save(output_path)
 
 
 if __name__ == '__main__':
