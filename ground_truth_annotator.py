@@ -18,7 +18,6 @@ Controls:
     S           - Save ground truth data
     T           - Toggle track trails
     P           - Toggle full path overlay (all labeled tracks)
-    Z           - Toggle zone lines overlay
     TAB         - Cycle info panel views
     +/-         - Speed up/slow down playback
     Q/ESC       - Quit and save
@@ -355,7 +354,6 @@ class GroundTruthAnnotator:
 
         # Display
         self.show_trails = True
-        self.show_zones = True
         self.show_full_paths = False  # Toggle with P - shows ALL labeled paths
         self.info_panel_mode = 2  # Start on UNLABELED ONLY
         self.selected_track_id: Optional[int] = None
@@ -467,25 +465,6 @@ class GroundTruthAnnotator:
         overlay = frame.copy()
         h, w = overlay.shape[:2]
         tracks = self.tracks
-
-        # ── Zone lines (subtle, dashed-look) ─────────────────────────
-        if self.show_zones:
-            for y_norm, label, color in [
-                (0.382, "SPAWN FAR",   (120, 220, 120)),
-                (0.57,  "SPAWN NEAR",  (120, 120, 220)),
-                (0.584, "THRESHOLD",   (0, 220, 220)),
-            ]:
-                py = int(y_norm * h)
-                # Dashed line effect
-                dash_len = 12
-                for x_start in range(0, w, dash_len * 2):
-                    cv2.line(overlay, (x_start, py), (min(x_start + dash_len, w), py), color, 1)
-                # Small label on right side with background
-                txt = f"{label} {y_norm}"
-                ts = cv2.getTextSize(txt, FONT, FONT_SMALL, 1)[0]
-                tx = w - ts[0] - 8
-                cv2.rectangle(overlay, (tx - 4, py - ts[1] - 4), (w, py + 4), (0, 0, 0), -1)
-                cv2.putText(overlay, txt, (tx, py), FONT, FONT_SMALL, color, 1, cv2.LINE_AA)
 
         # ── Detections from scanner ──────────────────────────────────
         if self.scanner:
@@ -869,7 +848,7 @@ class GroundTruthAnnotator:
             ("Browse",     "N = next unlabeled"),
             ("Edit",       "U = undo  D = delete"),
             ("Playback",   "SPACE  +/-  speed"),
-            ("Display",    "T trail  Z zone  P path"),
+            ("Display",    "T trail  P path"),
             ("Other",      "TAB mode  S save  Q quit"),
         ]
         for label_txt, keys_txt in helps:
@@ -984,11 +963,6 @@ class GroundTruthAnnotator:
         elif key == ord('t') or key == ord('T'):
             self.show_trails = not self.show_trails
             self.set_status(f"Trails: {'ON' if self.show_trails else 'OFF'}")
-            return "redraw"
-        # Zones
-        elif key == ord('z') or key == ord('Z'):
-            self.show_zones = not self.show_zones
-            self.set_status(f"Zones: {'ON' if self.show_zones else 'OFF'}")
             return "redraw"
         # Full paths
         elif key == ord('p') or key == ord('P'):
@@ -1364,7 +1338,7 @@ class GroundTruthAnnotator:
         print("  Click box + I/O   = Label as IN/OUT")
         print("  N                 = Next unlabeled track")
         print("  U/D               = Undo / Delete label")
-        print("\nOTHER: S=save T=trails P=paths Z=zones TAB=panel Q=quit")
+        print("\nOTHER: S=save T=trails P=paths TAB=panel Q=quit")
         print("="*60 + "\n")
 
         self._last_display = None
