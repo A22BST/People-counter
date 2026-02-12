@@ -17,6 +17,7 @@ Controls:
     D           - Delete label for a track
     S           - Save ground truth data
     T           - Toggle track trails
+    P           - Toggle full path overlay (all labeled tracks)
     Z           - Toggle zone lines overlay
     TAB         - Cycle info panel views
     +/-         - Speed up/slow down playback
@@ -39,6 +40,7 @@ import time
 import json
 import argparse
 import os
+import math
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -53,18 +55,34 @@ DETECTION_CONFIDENCE = 0.15
 SCAN_FRAME_SKIP = 3             # Process every Nth frame during background scan
 
 WINDOW_NAME = "Ground Truth Annotator"
-INFO_PANEL_WIDTH = 320
+INFO_PANEL_WIDTH = 380
 
-# Colors (BGR)
-COLOR_IN = (0, 200, 0)
-COLOR_OUT = (0, 0, 200)
-COLOR_UNLABELED = (200, 200, 0)
-COLOR_ACTIVE = (0, 255, 255)
-COLOR_LOST = (128, 128, 128)
-COLOR_PANEL_BG = (30, 30, 30)
-COLOR_TEXT = (220, 220, 220)
-COLOR_HIGHLIGHT = (0, 180, 255)
-COLOR_SCAN_BAR = (0, 200, 200)
+# ── Color Palette (BGR) ──────────────────────────────────────────────────────
+# Softer, higher-contrast palette designed for long annotation sessions.
+COLOR_IN = (80, 210, 80)           # Muted green
+COLOR_OUT = (80, 80, 220)          # Muted red-blue
+COLOR_UNLABELED = (0, 190, 220)    # Amber/yellow
+COLOR_ACTIVE = (0, 245, 255)       # Bright yellow highlight
+COLOR_LOST = (110, 110, 110)
+COLOR_PANEL_BG = (25, 25, 28)      # Near-black
+COLOR_PANEL_CARD = (40, 40, 45)    # Card background
+COLOR_PANEL_CARD_SEL = (55, 55, 65)  # Selected card
+COLOR_TEXT = (210, 210, 210)
+COLOR_TEXT_DIM = (130, 130, 135)
+COLOR_TEXT_BRIGHT = (245, 245, 245)
+COLOR_HIGHLIGHT = (0, 180, 255)    # Orange accent
+COLOR_SCAN_BAR = (200, 200, 0)     # Cyan
+COLOR_BAR_BG = (45, 45, 48)
+COLOR_DIVIDER = (65, 65, 70)
+COLOR_SUCCESS = (80, 200, 80)
+COLOR_WARN = (0, 160, 230)
+
+# Font helpers
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+FONT_SMALL = 0.38
+FONT_NORMAL = 0.44
+FONT_LARGE = 0.52
+FONT_XLARGE = 0.62
 
 # ============================================================================
 
@@ -306,7 +324,7 @@ class GroundTruthAnnotator:
 
     def __init__(self, source, confidence=0.15, model_path="yolov8s.pt",
                  record=False, output_dir=".", playback_speed=1.0,
-                 frame_skip=SCAN_FRAME_SKIP):
+                 frame_skip=SCAN_FRAME_SKIP, load_file=None):
         self.source = source
         self.confidence = confidence
         self.model_path = model_path
@@ -314,6 +332,7 @@ class GroundTruthAnnotator:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.frame_skip = frame_skip
+        self.load_file = load_file
 
         # Video state (display thread only)
         self.cap: Optional[cv2.VideoCapture] = None
@@ -337,10 +356,16 @@ class GroundTruthAnnotator:
         # Display
         self.show_trails = True
         self.show_zones = True
+        self.show_full_paths = False  # Toggle with P - shows ALL labeled paths
         self.info_panel_mode = 2  # Start on UNLABELED ONLY
         self.selected_track_id: Optional[int] = None
         self.last_frame_detections: List[Dict] = []
         self.panel_track_regions: List[Tuple[int, int, int, int, int]] = []
+
+        # Auto-save
+        self.autosave_interval = 60  # seconds
+        self.last_autosave = time.time()
+        self.save_count = 0
 
         # Status
         self.status_msg = ""
@@ -349,6 +374,26 @@ class GroundTruthAnnotator:
     def set_status(self, msg: str, duration: float = 2.0):
         self.status_msg = msg
         self.status_time = time.time() + duration
+
+    def load_annotations(self, filepath: str):
+        """Load labels from a previous ground truth JSON file."""
+        try:
+            with open(filepath) as f:
+                data = json.load(f)
+            tracks = data.get("tracks", {})
+            loaded = 0
+            for tid_str, tdata in tracks.items():
+                label = tdata.get("label")
+                if label in ("IN", "OUT"):
+                    self.annotation.labels[int(tid_str)] = label
+                    loaded += 1
+            print(f"[LOAD] Loaded {loaded} labels from {filepath}")
+            print(f"[LOAD]   IN: {sum(1 for v in self.annotation.labels.values() if v == 'IN')}")
+            print(f"[LOAD]   OUT: {sum(1 for v in self.annotation.labels.values() if v == 'OUT')}")
+            self.set_status(f"Loaded {loaded} labels from previous session", 5.0)
+        except Exception as e:
+            print(f"[LOAD] ERROR loading {filepath}: {e}")
+            self.set_status(f"Error loading: {e}", 5.0)
 
     @property
     def tracks(self) -> Dict[int, TrackData]:
@@ -423,28 +468,31 @@ class GroundTruthAnnotator:
         h, w = overlay.shape[:2]
         tracks = self.tracks
 
-        # Zone lines
+        # ── Zone lines (subtle, dashed-look) ─────────────────────────
         if self.show_zones:
-            near_y = int(0.584 * h)
-            cv2.line(overlay, (0, near_y), (w, near_y), (0, 255, 255), 1)
-            cv2.putText(overlay, "THRESHOLD 0.584", (5, near_y - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-            far_y = int(0.382 * h)
-            cv2.line(overlay, (0, far_y), (w, far_y), (100, 255, 100), 1)
-            cv2.putText(overlay, "SPAWN_FAR 0.382", (5, far_y - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 255, 100), 1)
-            spawn_near_y = int(0.57 * h)
-            cv2.line(overlay, (0, spawn_near_y), (w, spawn_near_y), (100, 100, 255), 1)
-            cv2.putText(overlay, "SPAWN_NEAR 0.57", (5, spawn_near_y + 15),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 255), 1)
+            for y_norm, label, color in [
+                (0.382, "SPAWN FAR",   (120, 220, 120)),
+                (0.57,  "SPAWN NEAR",  (120, 120, 220)),
+                (0.584, "THRESHOLD",   (0, 220, 220)),
+            ]:
+                py = int(y_norm * h)
+                # Dashed line effect
+                dash_len = 12
+                for x_start in range(0, w, dash_len * 2):
+                    cv2.line(overlay, (x_start, py), (min(x_start + dash_len, w), py), color, 1)
+                # Small label on right side with background
+                txt = f"{label} {y_norm}"
+                ts = cv2.getTextSize(txt, FONT, FONT_SMALL, 1)[0]
+                tx = w - ts[0] - 8
+                cv2.rectangle(overlay, (tx - 4, py - ts[1] - 4), (w, py + 4), (0, 0, 0), -1)
+                cv2.putText(overlay, txt, (tx, py), FONT, FONT_SMALL, color, 1, cv2.LINE_AA)
 
-        # Get detections for current frame from scanner cache
+        # ── Detections from scanner ──────────────────────────────────
         if self.scanner:
             self.last_frame_detections = self.scanner.get_nearest_detections(self.current_frame)
         else:
             self.last_frame_detections = []
 
-        # Draw detections
         for det in self.last_frame_detections:
             tid = det['track_id']
             x1, y1, x2, y2 = det['bbox']
@@ -462,79 +510,166 @@ class GroundTruthAnnotator:
                 color = COLOR_UNLABELED
                 label_text = "?"
 
-            thickness = 3 if tid == self.selected_track_id else 2
-            if tid == self.selected_track_id:
-                color = COLOR_ACTIVE
+            is_selected = (tid == self.selected_track_id)
+            box_color = COLOR_ACTIVE if is_selected else color
+            thickness = 2
 
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness)
+            # Box with corner accents instead of full rectangle for cleaner look
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), box_color, thickness)
+            if is_selected:
+                corner_len = min(15, (x2 - x1) // 3, (y2 - y1) // 3)
+                for cx, cy, dx, dy in [
+                    (x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)
+                ]:
+                    cv2.line(overlay, (cx, cy), (cx + dx * corner_len, cy), COLOR_ACTIVE, 3)
+                    cv2.line(overlay, (cx, cy), (cx, cy + dy * corner_len), COLOR_ACTIVE, 3)
 
-            info_text = f"ID:{tid} {conf:.2f} [{label_text}]"
-            ts = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-            cv2.rectangle(overlay, (x1, y1 - ts[1] - 8), (x1 + ts[0] + 4, y1), color, -1)
-            cv2.putText(overlay, info_text, (x1 + 2, y1 - 4),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            # ── Top label pill ──
+            id_str = f" {tid} "
+            label_str = f" {label_text} "
+            conf_str = f" {conf:.0%} "
 
+            # ID pill
+            id_sz = cv2.getTextSize(id_str, FONT, FONT_NORMAL, 1)[0]
+            lab_sz = cv2.getTextSize(label_str, FONT, FONT_NORMAL, 1)[0]
+            conf_sz = cv2.getTextSize(conf_str, FONT, FONT_SMALL, 1)[0]
+
+            pill_h = id_sz[1] + 10
+            pill_y = y1 - pill_h - 2
+            if pill_y < 0:
+                pill_y = y2 + 2  # Flip below if too close to top
+
+            # ID background
+            cv2.rectangle(overlay, (x1, pill_y), (x1 + id_sz[0] + 2, pill_y + pill_h), box_color, -1)
+            cv2.putText(overlay, id_str, (x1 + 1, pill_y + pill_h - 4),
+                       FONT, FONT_NORMAL, (0, 0, 0), 1, cv2.LINE_AA)
+
+            # Label pill (right of ID)
+            lx = x1 + id_sz[0] + 3
+            lab_bg = COLOR_IN if label_text == "IN" else (COLOR_OUT if label_text == "OUT" else (80, 80, 80))
+            cv2.rectangle(overlay, (lx, pill_y), (lx + lab_sz[0] + 2, pill_y + pill_h), lab_bg, -1)
+            cv2.putText(overlay, label_str, (lx + 1, pill_y + pill_h - 4),
+                       FONT, FONT_NORMAL, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # Confidence (smaller, dimmer, right of label)
+            cx_pos = lx + lab_sz[0] + 5
+            cv2.putText(overlay, conf_str, (cx_pos, pill_y + pill_h - 4),
+                       FONT, FONT_SMALL, (180, 180, 180), 1, cv2.LINE_AA)
+
+            # ── Bottom info (area + direction arrows) ──
             if track:
-                area_text = f"a:{det['area']:.4f} y:{det['centroid'][1]:.3f}"
-                cv2.putText(overlay, area_text, (x1, y2 + 15),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+                # Direction arrow below box
                 if track.y_trend != 0:
-                    arrow_y = "v" if track.y_trend > 0 else "^"
-                    arrow_a = "+" if track.area_trend > 0 else "-"
-                    cv2.putText(overlay, f"y{arrow_y} a{arrow_a}", (x1, y2 + 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+                    arrow = chr(0x2193) if track.y_trend > 0 else chr(0x2191)  # Unicode arrows may not render; use text
+                    arrow_y_txt = "v" if track.y_trend > 0 else "^"
+                    arrow_a_txt = "+" if track.area_trend > 0 else "-"
+                    info_txt = f"y{arrow_y_txt} a{arrow_a_txt}"
+                    cv2.putText(overlay, info_txt, (x1, y2 + 16),
+                               FONT, FONT_SMALL, (*box_color[:3],), 1, cv2.LINE_AA)
 
-            # Trail
+            # ── Trail ──
             if self.show_trails and track and len(track.bbox_history) > 1:
                 trail_pts = []
-                for bx1, by1, bx2, by2 in track.bbox_history[-20:]:
+                for bx1, by1, bx2, by2 in track.bbox_history[-25:]:
                     trail_pts.append(((bx1 + bx2) // 2, (by1 + by2) // 2))
                 for i in range(1, len(trail_pts)):
-                    cv2.line(overlay, trail_pts[i-1], trail_pts[i], color, max(1, int(i / len(trail_pts) * 3)))
+                    alpha = i / len(trail_pts)
+                    t = max(1, int(alpha * 2.5))
+                    # Fade color
+                    fade = tuple(int(c * alpha) for c in box_color)
+                    cv2.line(overlay, trail_pts[i-1], trail_pts[i], fade, t, cv2.LINE_AA)
 
-        # Input mode prompt
+        # ── Full path overlay for ALL labeled tracks (P key) ─────────
+        if self.show_full_paths:
+            for tid, label_dir in self.annotation.labels.items():
+                track = tracks.get(tid)
+                if not track or len(track.centroid_history) < 2:
+                    continue
+                path_color = COLOR_IN if label_dir == "IN" else COLOR_OUT
+                pts = []
+                for cx_norm, cy_norm in track.centroid_history:
+                    pts.append((int(cx_norm * w), int(cy_norm * h)))
+                for i in range(1, len(pts)):
+                    alpha = i / len(pts)
+                    t = max(1, int(alpha * 3))
+                    fade = tuple(int(c * (0.3 + 0.7 * alpha)) for c in path_color)
+                    cv2.line(overlay, pts[i-1], pts[i], fade, t, cv2.LINE_AA)
+                cv2.circle(overlay, pts[0], 5, path_color, -1, cv2.LINE_AA)
+                cv2.putText(overlay, str(tid), (pts[0][0] + 7, pts[0][1] - 3),
+                           FONT, FONT_SMALL, path_color, 1, cv2.LINE_AA)
+                cv2.drawMarker(overlay, pts[-1], path_color, cv2.MARKER_CROSS, 8, 2)
+
+        # ── Input mode prompt (bottom bar) ───────────────────────────
         if self.annotation.input_mode:
             mode_color = COLOR_IN if self.annotation.input_mode == "IN" else COLOR_OUT
             if self.annotation.input_mode == "DELETE":
-                mode_color = (0, 128, 255)
-            prompt = f"Enter Track ID for {self.annotation.input_mode}: {self.annotation.input_buffer}_"
-            cv2.rectangle(overlay, (0, h - 40), (w, h), (0, 0, 0), -1)
-            cv2.putText(overlay, prompt, (10, h - 12),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_color, 2)
+                mode_color = COLOR_WARN
+            # Semi-transparent bar
+            bar_overlay = overlay.copy()
+            cv2.rectangle(bar_overlay, (0, h - 44), (w, h), (0, 0, 0), -1)
+            cv2.addWeighted(bar_overlay, 0.85, overlay, 0.15, 0, overlay)
+            prompt = f"  Enter Track ID for {self.annotation.input_mode}: {self.annotation.input_buffer}_"
+            cv2.putText(overlay, prompt, (8, h - 14),
+                       FONT, FONT_LARGE, mode_color, 2, cv2.LINE_AA)
 
-        # Status message
+        # ── Status message (top toast) ───────────────────────────────
         if self.status_msg and time.time() < self.status_time:
-            cv2.rectangle(overlay, (0, 0), (w, 30), (0, 0, 0), -1)
-            cv2.putText(overlay, self.status_msg, (10, 22),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_HIGHLIGHT, 2)
+            # Semi-transparent background
+            toast_overlay = overlay.copy()
+            cv2.rectangle(toast_overlay, (0, 0), (w, 32), (0, 0, 0), -1)
+            cv2.addWeighted(toast_overlay, 0.8, overlay, 0.2, 0, overlay)
+            cv2.putText(overlay, f"  {self.status_msg}", (6, 22),
+                       FONT, FONT_LARGE, COLOR_HIGHLIGHT, 1, cv2.LINE_AA)
 
-        # Top info bar
+        # ── Top info bar ─────────────────────────────────────────────
         n_tracks = len(tracks)
         n_labeled = len(self.annotation.labels)
-        bar_text = f"Frame: {self.current_frame}"
+        in_count = sum(1 for v in self.annotation.labels.values() if v == "IN")
+        out_count = sum(1 for v in self.annotation.labels.values() if v == "OUT")
+
+        bar_h = 28
+        # Semi-transparent bar background
+        bar_ov = overlay.copy()
+        cv2.rectangle(bar_ov, (0, 0), (w, bar_h), COLOR_BAR_BG, -1)
+        cv2.addWeighted(bar_ov, 0.75, overlay, 0.25, 0, overlay)
+
+        # Frame info (left)
+        frame_txt = f"Frame {self.current_frame}"
         if self.total_frames > 0:
-            bar_text += f"/{self.total_frames} ({self.current_frame/self.total_frames*100:.1f}%)"
-        bar_text += f" | Speed: {self.playback_speed:.1f}x"
+            pct = self.current_frame / self.total_frames * 100
+            frame_txt += f" / {self.total_frames}  ({pct:.0f}%)"
+        cv2.putText(overlay, frame_txt, (8, 19), FONT, FONT_NORMAL, COLOR_TEXT, 1, cv2.LINE_AA)
+
+        # Speed + pause (center)
+        speed_txt = f"{self.playback_speed:.1f}x"
         if self.paused:
-            bar_text += " | PAUSED"
-        bar_text += f" | Tracks: {n_tracks} | Labeled: {n_labeled}"
+            speed_txt = "II PAUSED"
+        speed_sz = cv2.getTextSize(speed_txt, FONT, FONT_NORMAL, 1)[0]
+        cv2.putText(overlay, speed_txt, (w // 2 - speed_sz[0] // 2, 19),
+                   FONT, FONT_NORMAL,
+                   COLOR_WARN if self.paused else COLOR_TEXT_DIM, 1, cv2.LINE_AA)
 
-        cv2.rectangle(overlay, (0, 0), (w, 25), (40, 40, 40), -1)
-        cv2.putText(overlay, bar_text, (5, 18),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_TEXT, 1)
+        # Counts (right)
+        counts_txt = f"IN:{in_count}  OUT:{out_count}  ?:{n_tracks - n_labeled}"
+        counts_sz = cv2.getTextSize(counts_txt, FONT, FONT_NORMAL, 1)[0]
+        cv2.putText(overlay, counts_txt, (w - counts_sz[0] - 8, 19),
+                   FONT, FONT_NORMAL, COLOR_TEXT, 1, cv2.LINE_AA)
 
-        # Video progress bar
+        # ── Progress bar ─────────────────────────────────────────────
         if self.total_frames > 0:
-            bar_y = 25
+            bar_y = bar_h
             progress = self.current_frame / max(self.total_frames, 1)
-            cv2.rectangle(overlay, (0, bar_y), (w, bar_y + 4), (60, 60, 60), -1)
-            cv2.rectangle(overlay, (0, bar_y), (int(w * progress), bar_y + 4), COLOR_HIGHLIGHT, -1)
+            cv2.rectangle(overlay, (0, bar_y), (w, bar_y + 3), (50, 50, 53), -1)
+            cv2.rectangle(overlay, (0, bar_y), (int(w * progress), bar_y + 3), COLOR_HIGHLIGHT, -1)
+            # Playhead dot
+            px = int(w * progress)
+            cv2.circle(overlay, (px, bar_y + 1), 4, COLOR_HIGHLIGHT, -1, cv2.LINE_AA)
 
-            # Scan progress bar (underneath, thinner)
+            # Scan progress bar (underneath)
             if self.scanner and not self.scanner.scan_complete:
-                scan_bar_y = bar_y + 4
-                cv2.rectangle(overlay, (0, scan_bar_y), (w, scan_bar_y + 2), (40, 40, 40), -1)
-                cv2.rectangle(overlay, (0, scan_bar_y), (int(w * self.scanner.progress), scan_bar_y + 2),
+                scan_y = bar_y + 3
+                cv2.rectangle(overlay, (0, scan_y), (w, scan_y + 2), (35, 35, 38), -1)
+                cv2.rectangle(overlay, (0, scan_y), (int(w * self.scanner.progress), scan_y + 2),
                             COLOR_SCAN_BAR, -1)
 
         return overlay
@@ -542,46 +677,88 @@ class GroundTruthAnnotator:
     def draw_info_panel(self, frame: np.ndarray) -> np.ndarray:
         """Draw the side info panel showing tracks, labels, and help."""
         h = frame.shape[0]
-        panel = np.zeros((h, INFO_PANEL_WIDTH, 3), dtype=np.uint8)
+        pw = INFO_PANEL_WIDTH
+        panel = np.zeros((h, pw, 3), dtype=np.uint8)
         panel[:] = COLOR_PANEL_BG
         self.panel_track_regions = []
         tracks = self.tracks
 
-        y = 20
-        line_h = 18
+        y = 14
+        pad = 12  # left padding
 
-        # Scan status
+        # ── Header section ───────────────────────────────────────────
+        # Scan status badge
         if self.scanner and not self.scanner.scan_complete:
-            scan_text = f"SCANNING: {self.scanner.progress*100:.0f}% ({len(tracks)} tracks)"
-            cv2.putText(panel, scan_text, (5, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_SCAN_BAR, 1)
-            y += line_h + 2
+            pct = self.scanner.progress * 100
+            badge_txt = f"  SCANNING {pct:.0f}%  "
+            bsz = cv2.getTextSize(badge_txt, FONT, FONT_NORMAL, 1)[0]
+            # Animated-feel progress background
+            prog_w = int((pw - 2 * pad) * self.scanner.progress)
+            cv2.rectangle(panel, (pad, y - 2), (pad + prog_w, y + bsz[1] + 6), (35, 70, 70), -1)
+            cv2.rectangle(panel, (pad, y - 2), (pw - pad, y + bsz[1] + 6), COLOR_DIVIDER, 1)
+            cv2.putText(panel, badge_txt, (pad + 4, y + bsz[1] + 1),
+                       FONT, FONT_NORMAL, COLOR_SCAN_BAR, 1, cv2.LINE_AA)
+            trk_cnt = f"{len(tracks)} tracks"
+            ts2 = cv2.getTextSize(trk_cnt, FONT, FONT_SMALL, 1)[0]
+            cv2.putText(panel, trk_cnt, (pw - pad - ts2[0], y + bsz[1] + 1),
+                       FONT, FONT_SMALL, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+            y += bsz[1] + 14
         elif self.scanner and self.scanner.scan_complete:
-            cv2.putText(panel, f"SCAN DONE: {len(tracks)} tracks", (5, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 0), 1)
-            y += line_h + 2
+            done_txt = f"  DONE  {len(tracks)} tracks  "
+            dsz = cv2.getTextSize(done_txt, FONT, FONT_NORMAL, 1)[0]
+            cv2.rectangle(panel, (pad, y - 2), (pad + dsz[0] + 8, y + dsz[1] + 6), (30, 55, 30), -1)
+            cv2.putText(panel, done_txt, (pad + 4, y + dsz[1] + 1),
+                       FONT, FONT_NORMAL, COLOR_SUCCESS, 1, cv2.LINE_AA)
+            y += dsz[1] + 14
 
-        # Panel title
-        modes = ["ACTIVE (near frame)", "ALL TRACKS", "UNLABELED ONLY"]
-        title = modes[self.info_panel_mode % len(modes)]
-        cv2.putText(panel, f"=== {title} ===", (5, y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_HIGHLIGHT, 1)
-        y += line_h + 3
-
-        # Counters
+        # ── Counts row ───────────────────────────────────────────────
         in_count = sum(1 for v in self.annotation.labels.values() if v == "IN")
         out_count = sum(1 for v in self.annotation.labels.values() if v == "OUT")
         unlabeled = len(tracks) - len(self.annotation.labels)
-        cv2.putText(panel, f"IN: {in_count}  OUT: {out_count}  ?: {unlabeled}",
-                   (5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_TEXT, 1)
-        y += line_h + 3
 
-        cv2.line(panel, (5, y), (INFO_PANEL_WIDTH - 5, y), (80, 80, 80), 1)
+        # Draw colored count pills
+        cx = pad
+        for count_val, count_label, bg_color, fg_color in [
+            (in_count,  "IN",  (30, 65, 30),  COLOR_IN),
+            (out_count, "OUT", (55, 30, 30),  COLOR_OUT),
+            (unlabeled, "?",   (55, 55, 30),  COLOR_UNLABELED),
+        ]:
+            pill_txt = f" {count_label}:{count_val} "
+            psz = cv2.getTextSize(pill_txt, FONT, FONT_LARGE, 1)[0]
+            pill_w = psz[0] + 6
+            pill_h = psz[1] + 10
+            cv2.rectangle(panel, (cx, y), (cx + pill_w, y + pill_h), bg_color, -1)
+            cv2.rectangle(panel, (cx, y), (cx + pill_w, y + pill_h), fg_color, 1)
+            cv2.putText(panel, pill_txt, (cx + 3, y + pill_h - 4),
+                       FONT, FONT_LARGE, fg_color, 1, cv2.LINE_AA)
+            cx += pill_w + 6
+        y += pill_h + 10
+
+        # ── Mode selector tabs ───────────────────────────────────────
+        modes = ["NEARBY", "ALL", "UNLABELED"]
+        tab_x = pad
+        for i, mode_name in enumerate(modes):
+            is_active = (self.info_panel_mode % len(modes) == i)
+            msz = cv2.getTextSize(mode_name, FONT, FONT_SMALL, 1)[0]
+            tab_w = msz[0] + 12
+            if is_active:
+                cv2.rectangle(panel, (tab_x, y), (tab_x + tab_w, y + 20), COLOR_HIGHLIGHT, -1)
+                cv2.putText(panel, mode_name, (tab_x + 6, y + 15),
+                           FONT, FONT_SMALL, (0, 0, 0), 1, cv2.LINE_AA)
+            else:
+                cv2.rectangle(panel, (tab_x, y), (tab_x + tab_w, y + 20), COLOR_DIVIDER, 1)
+                cv2.putText(panel, mode_name, (tab_x + 6, y + 15),
+                           FONT, FONT_SMALL, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+            tab_x += tab_w + 4
+        y += 28
+
+        # ── Divider ──────────────────────────────────────────────────
+        cv2.line(panel, (pad, y), (pw - pad, y), COLOR_DIVIDER, 1)
         y += 8
 
+        # ── Track list ───────────────────────────────────────────────
         # Build track list based on mode
         if self.info_panel_mode == 0:
-            # Tracks visible near current frame (within 30 frames)
             cf = self.current_frame
             track_ids = sorted(
                 [tid for tid, t in tracks.items()
@@ -596,82 +773,110 @@ class GroundTruthAnnotator:
                 key=lambda tid: tracks[tid].first_frame
             )
 
-        for tid in track_ids:
-            if y > h - 150:
-                remaining = len(track_ids) - track_ids.index(tid)
-                cv2.putText(panel, f"... +{remaining} more (scroll N to see)",
-                           (5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, COLOR_TEXT, 1)
+        card_h = 44  # height per track card
+        help_area_h = 135
+        max_y = h - help_area_h
+
+        for idx, tid in enumerate(track_ids):
+            if y + card_h > max_y:
+                remaining = len(track_ids) - idx
+                cv2.putText(panel, f"  + {remaining} more  (press N to navigate)",
+                           (pad, y + 14), FONT, FONT_SMALL, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+                y += 20
                 break
 
             track = tracks.get(tid)
             if not track:
                 continue
 
-            # Color
             label = self.annotation.labels.get(tid)
-            if label:
-                color = COLOR_IN if label == "IN" else COLOR_OUT
-                label_str = f"[{label}]"
-            else:
-                color = COLOR_UNLABELED
-                label_str = "[?]"
+            is_selected = (tid == self.selected_track_id)
 
-            # Background highlight for selected
-            bg_y1 = y - 10
-            bg_y2 = y + line_h * 2 + 4
-            if tid == self.selected_track_id:
-                cv2.rectangle(panel, (0, bg_y1), (INFO_PANEL_WIDTH, bg_y2), (60, 60, 60), -1)
+            # ── Card background ──
+            card_y1 = y
+            card_y2 = y + card_h
+            bg = COLOR_PANEL_CARD_SEL if is_selected else COLOR_PANEL_CARD
+            cv2.rectangle(panel, (pad - 2, card_y1), (pw - pad + 2, card_y2), bg, -1)
+
+            # Left color strip
+            if label == "IN":
+                strip_color = COLOR_IN
+            elif label == "OUT":
+                strip_color = COLOR_OUT
+            else:
+                strip_color = COLOR_UNLABELED
+            cv2.rectangle(panel, (pad - 2, card_y1), (pad + 2, card_y2), strip_color, -1)
+
+            if is_selected:
+                cv2.rectangle(panel, (pad - 2, card_y1), (pw - pad + 2, card_y2), COLOR_ACTIVE, 1)
 
             # Clickable region
-            self.panel_track_regions.append((0, bg_y1, INFO_PANEL_WIDTH, bg_y2, tid))
+            self.panel_track_regions.append((0, card_y1, pw, card_y2, tid))
 
-            # ID line
-            id_text = f"ID:{tid:3d} {label_str}"
-            cv2.putText(panel, id_text, (5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+            # ── Row 1: ID + label + frame range ──
+            row1_y = card_y1 + 16
+            # ID
+            id_txt = f"ID {tid}"
+            cv2.putText(panel, id_txt, (pad + 8, row1_y),
+                       FONT, FONT_NORMAL, COLOR_TEXT_BRIGHT, 1, cv2.LINE_AA)
 
-            # Frame range
-            frame_text = f"F{track.first_frame}-{track.last_frame}"
-            cv2.putText(panel, frame_text, (160, y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1)
+            # Label badge
+            if label:
+                lb_txt = f" {label} "
+                lb_sz = cv2.getTextSize(lb_txt, FONT, FONT_SMALL, 1)[0]
+                lb_x = pad + 65
+                lb_bg = COLOR_IN if label == "IN" else COLOR_OUT
+                cv2.rectangle(panel, (lb_x, row1_y - lb_sz[1] - 2), (lb_x + lb_sz[0] + 4, row1_y + 3), lb_bg, -1)
+                cv2.putText(panel, lb_txt, (lb_x + 2, row1_y),
+                           FONT, FONT_SMALL, (255, 255, 255), 1, cv2.LINE_AA)
 
-            # Stats line
-            y += line_h
-            stats_text = f"conf:{track.max_confidence:.2f}"
+            # Frame range (right-aligned)
+            fr_txt = f"F{track.first_frame}-{track.last_frame}"
+            fr_sz = cv2.getTextSize(fr_txt, FONT, FONT_SMALL, 1)[0]
+            cv2.putText(panel, fr_txt, (pw - pad - fr_sz[0], row1_y),
+                       FONT, FONT_SMALL, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+
+            # ── Row 2: stats ──
+            row2_y = card_y1 + 34
+            stats_parts = []
+            stats_parts.append(f"c:{track.max_confidence:.0%}")
             if track.centroid_history:
-                first_y = track.centroid_history[0][1]
-                last_y = track.centroid_history[-1][1]
-                direction = "v" if last_y > first_y else "^"
-                stats_text += f"  y:{first_y:.2f}{direction}{last_y:.2f}"
-            cv2.putText(panel, stats_text, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (180, 180, 180), 1)
+                fy = track.centroid_history[0][1]
+                ly = track.centroid_history[-1][1]
+                arrow = "v" if ly > fy else "^"
+                stats_parts.append(f"y:{fy:.2f}{arrow}{ly:.2f}")
+            stats_parts.append(f"{track.total_frames_visible}f")
+            stats_line = "   ".join(stats_parts)
+            cv2.putText(panel, stats_line, (pad + 8, row2_y),
+                       FONT, FONT_SMALL, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
 
-            # Area info
-            y += line_h
-            if track.area_history:
-                first_a = track.area_history[0]
-                last_a = track.area_history[-1]
-                a_direction = "+" if last_a > first_a else "-"
-                area_text = f"area:{first_a:.4f}{a_direction}{last_a:.4f}  frames:{track.total_frames_visible}"
-                cv2.putText(panel, area_text, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (180, 180, 180), 1)
+            y = card_y2 + 3  # gap between cards
 
-            y += line_h + 6
+        # ── Help section (bottom) ────────────────────────────────────
+        help_y = h - help_area_h
+        cv2.line(panel, (pad, help_y), (pw - pad, help_y), COLOR_DIVIDER, 1)
+        help_y += 6
 
-        # Help text at bottom
-        help_y = h - 140
-        cv2.line(panel, (5, help_y), (INFO_PANEL_WIDTH - 5, help_y), (80, 80, 80), 1)
-        help_y += 15
+        # Help title
+        cv2.putText(panel, "KEYBOARD SHORTCUTS", (pad, help_y + 12),
+                   FONT, FONT_SMALL, COLOR_HIGHLIGHT, 1, cv2.LINE_AA)
+        help_y += 22
+
         helps = [
-            "CLICK ID = jump to track",
-            "LEFT/RIGHT = 1 frame  |  <> = 10",
-            "[] = 100 frames  |  H/E = start/end",
-            "I = IN  |  O = OUT  |  N = next ?",
-            "U = undo  |  D = delete label",
-            "SPACE = pause  |  +/- = speed",
-            "T = trails  |  Z = zones",
-            "TAB = panel mode  |  S = save",
-            "Q = quit & save"
+            ("Navigate",   "<  >  [  ]  H  E"),
+            ("Label",      "I = IN   O = OUT"),
+            ("Select",     "Click box or panel"),
+            ("Browse",     "N = next unlabeled"),
+            ("Edit",       "U = undo  D = delete"),
+            ("Playback",   "SPACE  +/-  speed"),
+            ("Display",    "T trail  Z zone  P path"),
+            ("Other",      "TAB mode  S save  Q quit"),
         ]
-        for line in helps:
-            cv2.putText(panel, line, (5, help_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.33, (140, 140, 140), 1)
+        for label_txt, keys_txt in helps:
+            cv2.putText(panel, label_txt, (pad + 2, help_y),
+                       FONT, FONT_SMALL, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+            cv2.putText(panel, keys_txt, (pad + 72, help_y),
+                       FONT, FONT_SMALL, COLOR_TEXT, 1, cv2.LINE_AA)
             help_y += 14
 
         return np.hstack([frame, panel])
@@ -681,7 +886,7 @@ class GroundTruthAnnotator:
             return
 
         # Progress bar click (top of video area)
-        if self.is_video_file and self.total_frames > 0 and 25 <= y <= 32 and x < self.frame_width:
+        if self.is_video_file and self.total_frames > 0 and 24 <= y <= 36 and x < self.frame_width:
             progress = x / self.frame_width
             target = int(progress * self.total_frames)
             self.paused = True
@@ -784,6 +989,11 @@ class GroundTruthAnnotator:
         elif key == ord('z') or key == ord('Z'):
             self.show_zones = not self.show_zones
             self.set_status(f"Zones: {'ON' if self.show_zones else 'OFF'}")
+            return "redraw"
+        # Full paths
+        elif key == ord('p') or key == ord('P'):
+            self.show_full_paths = not self.show_full_paths
+            self.set_status(f"Full paths: {'ON' if self.show_full_paths else 'OFF'} ({len(self.annotation.labels)} labeled)")
             return "redraw"
         # Tab - cycle panel mode
         elif key == 9:
@@ -929,6 +1139,45 @@ class GroundTruthAnnotator:
 
         track_data = {}
         for tid, track in tracks.items():
+            # Compute per-step velocity if we have enough path points
+            velocities = []
+            if len(track.centroid_history) >= 2 and len(track.frame_numbers) >= 2:
+                for i in range(1, len(track.centroid_history)):
+                    dx = track.centroid_history[i][0] - track.centroid_history[i-1][0]
+                    dy = track.centroid_history[i][1] - track.centroid_history[i-1][1]
+                    dt = track.frame_numbers[i] - track.frame_numbers[i-1]
+                    if dt > 0:
+                        velocities.append({
+                            "vx": round(dx / dt, 6),
+                            "vy": round(dy / dt, 6),
+                            "speed": round((dx**2 + dy**2)**0.5 / dt, 6),
+                        })
+
+            # Compute path length (total distance traveled)
+            path_length = 0.0
+            if len(track.centroid_history) >= 2:
+                for i in range(1, len(track.centroid_history)):
+                    dx = track.centroid_history[i][0] - track.centroid_history[i-1][0]
+                    dy = track.centroid_history[i][1] - track.centroid_history[i-1][1]
+                    path_length += (dx**2 + dy**2)**0.5
+
+            # Straight-line displacement
+            displacement = 0.0
+            if len(track.centroid_history) >= 2:
+                dx = track.centroid_history[-1][0] - track.centroid_history[0][0]
+                dy = track.centroid_history[-1][1] - track.centroid_history[0][1]
+                displacement = (dx**2 + dy**2)**0.5
+
+            # Linearity ratio (1.0 = perfectly straight line)
+            linearity = round(displacement / path_length, 4) if path_length > 0 else 0.0
+
+            # Direction angle (degrees, 0=right, 90=down, etc.)
+            direction_angle = None
+            if len(track.centroid_history) >= 2:
+                dx = track.centroid_history[-1][0] - track.centroid_history[0][0]
+                dy = track.centroid_history[-1][1] - track.centroid_history[0][1]
+                direction_angle = round(math.degrees(math.atan2(dy, dx)), 2)
+
             track_data[str(tid)] = {
                 "track_id": tid,
                 "label": self.annotation.labels.get(tid),
@@ -943,12 +1192,25 @@ class GroundTruthAnnotator:
                 "y_trend": round(track.y_trend, 6),
                 "first_centroid_y": round(track.centroid_history[0][1], 4) if track.centroid_history else None,
                 "last_centroid_y": round(track.centroid_history[-1][1], 4) if track.centroid_history else None,
+                "first_centroid_x": round(track.centroid_history[0][0], 4) if track.centroid_history else None,
+                "last_centroid_x": round(track.centroid_history[-1][0], 4) if track.centroid_history else None,
                 "first_area": round(track.area_history[0], 6) if track.area_history else None,
                 "last_area": round(track.area_history[-1], 6) if track.area_history else None,
+                # Full 2D path (normalized 0-1)
+                "path": [{"x": round(p[0], 4), "y": round(p[1], 4)} for p in track.centroid_history],
+                "centroid_x_history": [round(p[0], 4) for p in track.centroid_history],
                 "centroid_y_history": [round(p[1], 4) for p in track.centroid_history],
+                "bbox_history": [list(b) for b in track.bbox_history],
                 "area_history": [round(a, 6) for a in track.area_history],
                 "confidence_history": [round(c, 4) for c in track.confidence_history],
                 "frame_numbers": track.frame_numbers,
+                # Path metrics
+                "path_length": round(path_length, 6),
+                "displacement": round(displacement, 6),
+                "linearity": linearity,
+                "direction_angle": direction_angle,
+                "velocities": velocities,
+                "avg_speed": round(sum(v["speed"] for v in velocities) / len(velocities), 6) if velocities else 0,
             }
 
         in_tracks = {tid: d for tid, d in track_data.items() if d["label"] == "IN"}
@@ -1073,6 +1335,10 @@ class GroundTruthAnnotator:
         """Main loop: display video, handle input, while scanner runs in background."""
         self.open_source()
 
+        # Load previous annotations if specified
+        if self.load_file:
+            self.load_annotations(self.load_file)
+
         # Start background scanner for video files
         if self.is_video_file:
             self.paused = True
@@ -1098,7 +1364,7 @@ class GroundTruthAnnotator:
         print("  Click box + I/O   = Label as IN/OUT")
         print("  N                 = Next unlabeled track")
         print("  U/D               = Undo / Delete label")
-        print("\nOTHER: S=save T=trails Z=zones TAB=panel Q=quit")
+        print("\nOTHER: S=save T=trails P=paths Z=zones TAB=panel Q=quit")
         print("="*60 + "\n")
 
         self._last_display = None
@@ -1150,6 +1416,13 @@ class GroundTruthAnnotator:
                 if self._last_display is not None:
                     cv2.imshow(WINDOW_NAME, self._last_display)
 
+                # Auto-save periodically
+                now = time.time()
+                if self.annotation.labels and now - self.last_autosave > self.autosave_interval:
+                    self.save_ground_truth()
+                    self.last_autosave = now
+                    self.set_status(f"Auto-saved ({len(self.annotation.labels)} labels)", 2.0)
+
                 wait_ms = 30 if self.paused else max(1, int((1000 / self.fps) / self.playback_speed))
                 key = cv2.waitKey(wait_ms) & 0xFF
 
@@ -1193,6 +1466,8 @@ def main():
                         help='Initial playback speed')
     parser.add_argument('--frame-skip', type=int, default=SCAN_FRAME_SKIP,
                         help=f'Scan every Nth frame (default: {SCAN_FRAME_SKIP})')
+    parser.add_argument('--load', type=str, default=None,
+                        help='Load labels from a previous ground_truth_*.json file')
 
     args = parser.parse_args()
 
@@ -1204,6 +1479,7 @@ def main():
         output_dir=args.output_dir,
         playback_speed=args.speed,
         frame_skip=args.frame_skip,
+        load_file=args.load,
     )
     annotator.run()
 
