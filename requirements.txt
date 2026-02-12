@@ -6,6 +6,9 @@ ultralytics>=8.0.0          # YOLOv8 with built-in ByteTrack
 opencv-python>=4.8.0        # Video capture and visualization
 numpy>=1.24.0               # Numerical operations
 
+# Sensor fusion
+pyserial>=3.5               # ESP32 serial communication (ToF sensor)
+
 # Visualization and analysis
 matplotlib>=3.7.0           # Analysis plots
 
